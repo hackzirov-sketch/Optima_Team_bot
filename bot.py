@@ -607,6 +607,7 @@ async def start(message: Message):
 
 
 async def show_role_picker(message):
+    await message.answer("Pastki menyu yangilandi.", reply_markup=main_kb(superadmin=True))
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👑 Superadmin", callback_data="mode:superadmin", style="primary")],
         [InlineKeyboardButton(text="🛡 Admin", callback_data="mode:admin", style="success")],
@@ -639,10 +640,11 @@ async def select_specialty(call: CallbackQuery, state: FSMContext):
 
 async def ask_phone(message, state):
     await state.set_state(Application.phone)
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)],
-                                       [KeyboardButton(text="⬅️ Ortga")]],
-                             resize_keyboard=True, one_time_keyboard=True)
-    await message.answer("Telefon raqamingizni yuboring yoki matn ko‘rinishida yozing:", reply_markup=kb)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Ortga", callback_data="formback:age")],
+        [InlineKeyboardButton(text="🏠 Bosh sahifa", callback_data="nav:home", design_key="home")],
+    ])
+    await message.answer("Telefon raqamingizni matn ko‘rinishida yozing. Masalan: <code>+998901234567</code>", reply_markup=kb)
 
 
 @router.message(F.text.in_(menu_texts("🔄 Rolni almashtirish")))
