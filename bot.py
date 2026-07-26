@@ -198,8 +198,12 @@ BUTTON_LABELS = dict(BUTTON_CATALOG)
 
 def infer_button_key(text: str):
     clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    _clean_icon, clean_sep, clean_without_icon = clean.partition(" ")
+    clean_plain = clean_without_icon if clean_sep and _clean_icon and not _clean_icon[0].isalnum() else clean
     for key, label in BUTTON_CATALOG:
-        if clean == label or clean.startswith(label + " "):
+        _label_icon, label_sep, label_without_icon = label.partition(" ")
+        label_plain = label_without_icon if label_sep and _label_icon and not _label_icon[0].isalnum() else label
+        if clean == label or clean.startswith(label + " ") or clean_plain == label_plain:
             return key
     if "Bosh menyu" in clean or "Bosh sahifa" in clean: return "home"
     if "Ro‘yxat" in clean or "Qayta tanlash" in clean: return "design_list"
