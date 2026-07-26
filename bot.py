@@ -184,7 +184,7 @@ def h(value, limit=1000):
 
 def user_mention(user, limit=60):
     data = dict(user)
-    label = f"@{data['username']}" if data.get("username") else data.get("full_name") or str(data["tg_id"])
+    label = data.get("full_name") or (f"@{data['username']}" if data.get("username") else str(data["tg_id"]))
     return f"<a href='tg://user?id={int(data['tg_id'])}'>{h(label, limit)}</a>"
 
 
@@ -310,7 +310,8 @@ async def init_db():
 
 async def ensure_user(tg_user):
     await db_execute("""INSERT INTO users(tg_id,username,full_name) VALUES(?,?,?)
-      ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username,full_name=excluded.full_name""",
+      ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username,
+      full_name=CASE WHEN users.status='draft' THEN excluded.full_name ELSE users.full_name END""",
       (tg_user.id, tg_user.username, tg_user.full_name))
 
 
