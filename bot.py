@@ -359,6 +359,33 @@ def main_kb(staff=False, superadmin=False):
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
+def main_inline_kb(staff=False, superadmin=False):
+    rows = [[InlineKeyboardButton(text="📝 Ariza to‘ldirish", callback_data="menu:application")]]
+    if staff:
+        rows += [[InlineKeyboardButton(text="📊 Admin panel", callback_data="menu:panel"),
+                  InlineKeyboardButton(text="👥 Userlar", callback_data="menu:users")],
+                 [InlineKeyboardButton(text="➕ Topshiriq", callback_data="menu:new_task"),
+                  InlineKeyboardButton(text="📋 Topshiriqlar", callback_data="menu:tasks")],
+                 [InlineKeyboardButton(text="📂 Guruhlar", callback_data="menu:groups")]]
+    if superadmin:
+        rows += [[InlineKeyboardButton(text="🛡 Adminlar", callback_data="menu:admins"),
+                  InlineKeyboardButton(text="🎨 Tugma dizayni", callback_data="menu:design")],
+                 [InlineKeyboardButton(text="🔄 Rolni almashtirish", callback_data="menu:switch_role")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_main_menu(message, staff=False, superadmin=False):
+    private = message.chat.type == ChatType.PRIVATE
+    if private:
+        await message.answer("⌨️ Pastki menyu ham faol.", reply_markup=main_kb(staff, superadmin))
+    await message.answer("Kerakli bo‘limni tanlang:", reply_markup=main_inline_kb(staff, superadmin))
+
+
+def menu_texts(label):
+    _icon, separator, plain = label.partition(" ")
+    return {label, plain if separator else label}
+
+
 def app_text(data, user=None):
     username = (user.username if user else None) or data.get("username") or "yo‘q"
     full_name = (user.full_name if user else None) or data.get("full_name", "")
@@ -373,7 +400,8 @@ async def start(message: Message):
     await ensure_user(message.from_user)
     if await role_of(message.from_user.id) == "superadmin":
         return await show_role_picker(message)
-    await message.answer("Assalomu alaykum! Kerakli bo‘limni tanlang.", reply_markup=main_kb(await is_staff(message.from_user.id)))
+    staff = await is_staff(message.from_user.id)
+    await send_main_menu(message, staff)
 
 
 async def show_role_picker(message):
@@ -413,7 +441,7 @@ async def ask_phone(message, state):
     await message.answer("Telefon raqamingizni yuboring yoki matn ko‘rinishida yozing:", reply_markup=kb)
 
 
-@router.message(F.text == "🔄 Rolni almashtirish")
+@router.message(F.text.in_(menu_texts("🔄 Rolni almashtirish")))
 async def change_mode(message: Message):
     if await role_of(message.from_user.id) != "superadmin": return
     await show_role_picker(message)
@@ -426,7 +454,7 @@ async def select_mode(call: CallbackQuery):
     if mode not in {"superadmin", "admin", "user"}: return await call.answer("Noto‘g‘ri rol", show_alert=True)
     await db_execute("UPDATE users SET active_mode=? WHERE tg_id=?", (mode, call.from_user.id))
     await call.message.edit_text(f"✅ <b>{ROLE_LABELS[mode]}</b> rejimi tanlandi.")
-    await call.message.answer("Bosh sahifa", reply_markup=main_kb(mode in {"superadmin","admin"}, mode == "superadmin"))
+    await send_main_menu(call.message, mode in {"superadmin","admin"}, mode == "superadmin")
     await call.answer()
 
 
@@ -446,7 +474,7 @@ async def admins_markup():
     return "\n".join(lines), kb
 
 
-@router.message(F.text == "🛡 Adminlar")
+@router.message(F.text.in_(menu_texts("🛡 Adminlar")))
 async def admins_list(message: Message):
     if not await require_superadmin(message.from_user.id): return await message.answer("Superadmin rejimini tanlang.")
     text, kb = await admins_markup(); await message.answer(text, reply_markup=kb)
@@ -531,7 +559,7 @@ async def show_design_catalog(target, page=0, edit=False):
         await target.answer(text, reply_markup=kb)
 
 
-@router.message(F.text == "🎨 Tugma dizayni")
+@router.message(F.text.in_(menu_texts("🎨 Tugma dizayni")))
 async def design_panel(message: Message):
     if not await require_superadmin(message.from_user.id): return await message.answer("Superadmin rejimini tanlang.")
     await show_design_catalog(message)
@@ -659,13 +687,15 @@ async def reset_selected_design(call: CallbackQuery, state: FSMContext):
 
 
 @router.message(Command("cancel"))
-@router.message(F.text == "❌ Bekor qilish")
+@router.message(F.text.in_(menu_texts("❌ Bekor qilish")))
 async def cancel(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Amal bekor qilindi.", reply_markup=main_kb(await is_staff(message.from_user.id)))
+    await message.answer("Amal bekor qilindi.", reply_markup=ReplyKeyboardRemove() if message.chat.type != ChatType.PRIVATE else None)
+    role = await effective_role(message.from_user.id)
+    await send_main_menu(message, role in {"superadmin", "admin", "manager"}, role == "superadmin")
 
 
-@router.message(F.text == "📝 Ariza to‘ldirish")
+@router.message(F.text.in_(menu_texts("📝 Ariza to‘ldirish")))
 async def application_start(message: Message, state: FSMContext):
     if message.chat.type != ChatType.PRIVATE:
         return await message.answer("Ariza shaxsiy ma’lumotlarni saqlaydi. Uni botning shaxsiy chatida to‘ldiring.")
@@ -769,7 +799,7 @@ async def users_keyboard(page=0):
 
 
 @router.message(Command("panel"))
-@router.message(F.text == "📊 Admin panel")
+@router.message(F.text.in_(menu_texts("📊 Admin panel")))
 async def panel(message: Message):
     if not await is_staff(message.from_user.id): return await message.answer("Bu bo‘lim uchun ruxsat yo‘q.")
     stats = await db_one("""SELECT COUNT(*) total,
@@ -826,7 +856,7 @@ async def pending_detail(call: CallbackQuery):
     await call.message.edit_text(app_text(data), reply_markup=kb); await call.answer()
 
 
-@router.message(F.text == "👥 Userlar")
+@router.message(F.text.in_(menu_texts("👥 Userlar")))
 async def users_list(message: Message):
     if not await is_staff(message.from_user.id): return
     kb, total = await users_keyboard()
@@ -886,6 +916,23 @@ async def toggle_block(call: CallbackQuery, bot: Bot):
 async def noop(call: CallbackQuery): await call.answer()
 
 
+@router.callback_query(F.data.startswith("menu:"))
+async def inline_main_menu(call: CallbackQuery, state: FSMContext):
+    await ensure_user(call.from_user)
+    action = call.data.split(":", 1)[1]
+    actor_message = call.message.model_copy(update={"from_user": call.from_user})
+    await call.answer()
+    if action == "application": return await application_start(actor_message, state)
+    if action == "panel": return await panel(actor_message)
+    if action == "users": return await users_list(actor_message)
+    if action == "groups": return await groups_list(actor_message)
+    if action == "new_task": return await task_start(actor_message, state)
+    if action == "tasks": return await tasks_list(actor_message)
+    if action == "admins": return await admins_list(actor_message)
+    if action == "design": return await design_panel(actor_message)
+    if action == "switch_role": return await change_mode(actor_message)
+
+
 @router.message(Command("register_group"))
 async def register_group(message: Message):
     if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}: return await message.answer("Bu buyruqni guruhda yuboring.")
@@ -913,7 +960,7 @@ async def add_group_by_id(message: Message, bot: Bot):
     await message.answer(f"✅ {html.escape(title)} ro‘yxatga qo‘shildi.")
 
 
-@router.message(F.text == "📂 Guruhlar")
+@router.message(F.text.in_(menu_texts("📂 Guruhlar")))
 async def groups_list(message: Message):
     if not await is_staff(message.from_user.id): return
     text, kb = await groups_view(await effective_role(message.from_user.id) in {"admin","superadmin"})
@@ -950,7 +997,7 @@ async def delete_group(call: CallbackQuery):
     await call.answer(f"{group['title']} ro‘yxatdan olib tashlandi", show_alert=True)
 
 
-@router.message(F.text == "➕ Topshiriq")
+@router.message(F.text.in_(menu_texts("➕ Topshiriq")))
 async def task_start(message: Message, state: FSMContext):
     if not await is_staff(message.from_user.id): return
     await state.clear(); await state.set_state(TaskForm.name)
@@ -1072,7 +1119,7 @@ async def tasks_keyboard(page=0):
     return b.as_markup(), total
 
 
-@router.message(F.text == "📋 Topshiriqlar")
+@router.message(F.text.in_(menu_texts("📋 Topshiriqlar")))
 async def tasks_list(message: Message):
     if not await is_staff(message.from_user.id): return
     kb, total = await tasks_keyboard()
