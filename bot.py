@@ -112,7 +112,8 @@ DESIGN = {"button_style": "primary", "premium_emoji_id": "", "button_designs": {
 
 BUTTON_CATALOG = [
     ("application", "📝 Ariza to‘ldirish"), ("admin_panel", "📊 Admin panel"),
-    ("users", "👥 Userlar"), ("new_task", "➕ Topshiriq"),
+    ("users", "👥 Userlar"), ("team", "👥 Jamoa"), ("team_admins", "🛡 Adminlar"),
+    ("team_managers", "🧑‍💼 Managerlar"), ("team_developers", "💻 Dasturchilar"), ("new_task", "➕ Topshiriq"),
     ("tasks", "📋 Topshiriqlar"), ("groups", "📂 Guruhlar"),
     ("admins", "🛡 Adminlar"), ("button_design", "🎨 Tugma dizayni"),
     ("switch_role", "🔄 Rolni almashtirish"), ("superadmin", "👑 Superadmin"),
@@ -423,7 +424,7 @@ def main_kb(staff=False, superadmin=False, show_application=True, accepted_user=
     if not staff and accepted_user:
         rows += [[kb_button("📥 Vazifalar"), kb_button("✅ Tugallangan vazifalarim")], [kb_button("👤 Profilim")]]
     if staff:
-        rows += [[kb_button("📊 Admin panel"), kb_button("👥 Userlar")],
+        rows += [[kb_button("📊 Admin panel")],
                  [kb_button("➕ Topshiriq"), kb_button("📋 Topshiriqlar")],
                  [kb_button("📂 Guruhlar")]]
     if superadmin:
@@ -441,8 +442,7 @@ def main_inline_kb(staff=False, superadmin=False, show_application=True, accepte
                   InlineKeyboardButton(text="✅ Tugallangan vazifalarim", callback_data="menu:my_completed")],
                  [InlineKeyboardButton(text="👤 Profilim", callback_data="menu:profile")]]
     if staff:
-        rows += [[InlineKeyboardButton(text="📊 Admin panel", callback_data="menu:panel"),
-                  InlineKeyboardButton(text="👥 Userlar", callback_data="menu:users")],
+        rows += [[InlineKeyboardButton(text="📊 Admin panel", callback_data="menu:panel")],
                  [InlineKeyboardButton(text="➕ Topshiriq", callback_data="menu:new_task"),
                   InlineKeyboardButton(text="📋 Topshiriqlar", callback_data="menu:tasks")],
                  [InlineKeyboardButton(text="📂 Guruhlar", callback_data="menu:groups")]]
@@ -1046,7 +1046,7 @@ async def panel(message: Message):
     leaderboard="\n".join(f"{i+1}. {h(x['full_name'],60)} — {x['done']}" for i,x in enumerate(leaders)) or "Hozircha yo‘q"
     b = InlineKeyboardBuilder()
     b.button(text=f"⏳ Arizalar ({stats['pending'] or 0})", callback_data="pending:0")
-    b.button(text="👥 Userlar", callback_data="users:0")
+    b.button(text="👥 Jamoa", callback_data="team:categories")
     b.button(text="📋 Topshiriqlar", callback_data="tasks:0")
     b.button(text="📂 Guruhlar", callback_data="groups:show")
     b.button(text="🔎 Qidiruv", callback_data="menu:search")
@@ -1101,8 +1101,64 @@ async def pending_detail(call: CallbackQuery):
 @router.message(F.text.in_(menu_texts("👥 Userlar")))
 async def users_list(message: Message):
     if not await is_staff(message.from_user.id): return
-    kb, total = await users_keyboard(viewer_id=message.from_user.id)
-    await message.answer(f"<b>👥 Userlar</b> — jami {total}\nBatafsil ko‘rish uchun userni tanlang:", reply_markup=kb)
+    await show_team_categories(message)
+
+
+async def team_counts():
+    return await db_one("""SELECT
+      COUNT(*) FILTER (WHERE role='admin') admins,
+      COUNT(*) FILTER (WHERE role='manager') managers,
+      COUNT(*) FILTER (WHERE role='user' AND status='accepted') developers
+      FROM users""")
+
+
+async def show_team_categories(message, edit=False):
+    counts=await team_counts()
+    kb=InlineKeyboardMarkup(inline_keyboard=[
+      [InlineKeyboardButton(text=f"🛡 Adminlar ({counts['admins'] or 0})",callback_data="teamlist:admin")],
+      [InlineKeyboardButton(text=f"🧑‍💼 Managerlar ({counts['managers'] or 0})",callback_data="teamlist:manager")],
+      [InlineKeyboardButton(text=f"💻 Dasturchilar ({counts['developers'] or 0})",callback_data="teamlist:developer")],
+      [InlineKeyboardButton(text="⬅️ Admin panel",callback_data="menu:panel")],
+    ])
+    text="<b>👥 Jamoa</b>\n\nKo‘rmoqchi bo‘lgan bo‘limni tanlang:"
+    if edit:await message.edit_text(text,reply_markup=kb)
+    else:await message.answer(text,reply_markup=kb)
+
+
+@router.callback_query(F.data=="team:categories")
+async def team_categories_callback(call:CallbackQuery):
+    if not await is_staff(call.from_user.id):return await call.answer("Ruxsat yo‘q",show_alert=True)
+    await show_team_categories(call.message,True);await call.answer()
+
+
+@router.callback_query(F.data.startswith("teamlist:"))
+async def team_list_callback(call:CallbackQuery):
+    if not await is_staff(call.from_user.id):return await call.answer("Ruxsat yo‘q",show_alert=True)
+    category=call.data.split(':',1)[1]
+    if category=='admin':where="role='admin'";title="🛡 Adminlar"
+    elif category=='manager':where="role='manager'";title="🧑‍💼 Managerlar"
+    elif category=='developer':where="role='user' AND status='accepted'";title="💻 Dasturchilar"
+    else:return await call.answer("Bo‘lim topilmadi",show_alert=True)
+    rows=await db_all(f"SELECT tg_id,full_name,specialty,status FROM users WHERE {where} ORDER BY full_name LIMIT 100")
+    b=InlineKeyboardBuilder()
+    for u in rows:b.button(text=u['full_name'][:55],callback_data=f"teamusr:{u['tg_id']}:{category}")
+    b.button(text="⬅️ Jamoa",callback_data="team:categories");b.adjust(1)
+    await call.message.edit_text(f"<b>{title}</b> — {len(rows)} ta\n\nMa’lumotni ko‘rish uchun ism-familiyani tanlang:",reply_markup=b.as_markup());await call.answer()
+
+
+@router.callback_query(F.data.startswith("teamusr:"))
+async def team_user_detail(call:CallbackQuery):
+    if not await is_staff(call.from_user.id):return await call.answer("Ruxsat yo‘q",show_alert=True)
+    _,raw_uid,category=call.data.split(':');u=await db_one("SELECT * FROM users WHERE tg_id=?",(int(raw_uid),))
+    if not u or u['role']=='superadmin':return await call.answer("User topilmadi",show_alert=True)
+    text=(f"<b>👤 {h(u['full_name'],200)}</b>\n\n🎂 Yosh: {h(u['age'] or '—',20)}\n🆔 ID: <code>{u['tg_id']}</code>\n"
+          f"🔗 Username: @{h(u['username'] or '—',80)}\n☎️ Telefon: {h(u['phone'] or '—',100)}\n"
+          f"🛡 Vakolat: {ROLE_LABELS[u['role']]}\n💼 Yo‘nalish: {SPECIALTIES.get(u['specialty'],'Tanlanmagan')}\n"
+          f"📊 Holat: {STATUS_LABELS[u['status']]}\n\n<b>Portfolio:</b>\n{portfolio_display(u)}\n\n<b>O‘zi haqida:</b>\n{h(u['about'] or '—',1800)}")
+    buttons=[]
+    if u['portfolio_file_id']:buttons.append([InlineKeyboardButton(text="📄 Portfolio faylini ko‘rish",callback_data=f"portfolio:{u['tg_id']}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Ro‘yxat",callback_data=f"teamlist:{category}")])
+    await call.message.answer(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons));await call.answer()
 
 
 @router.callback_query(F.data.startswith("users:"))
