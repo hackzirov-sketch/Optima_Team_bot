@@ -391,6 +391,11 @@ async def is_staff(user_id: int) -> bool:
     return await effective_role(user_id) in {"superadmin", "admin", "manager"}
 
 
+async def is_actual_staff(user_id: int) -> bool:
+    """Direct moderation buttons must respect the permanent role, not the selected UI mode."""
+    return await role_of(user_id) in {"superadmin", "admin", "manager"}
+
+
 async def load_design():
     with suppress(Exception):
         for row in await db_all("SELECT key,value FROM settings"):
@@ -842,6 +847,7 @@ async def app_full_name(message: Message, state: FSMContext):
     if len(full_name.split()) < 2:
         return await message.answer("Ism va familiyani to‘liq kiriting. Masalan: Ali Valiyev")
     await state.update_data(full_name=full_name)
+    await db_execute("UPDATE users SET full_name=? WHERE tg_id=?", (full_name, message.from_user.id))
     await state.set_state(Application.age)
     await message.answer("Yoshingizni raqam bilan kiriting (14–100):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="⬅️ Ortga", callback_data="formback:full_name")
@@ -852,7 +858,9 @@ async def app_full_name(message: Message, state: FSMContext):
 async def app_age(message: Message, state: FSMContext):
     if not message.text.isdigit() or not 14 <= int(message.text) <= 100:
         return await message.answer("Yosh 14 dan 100 gacha bo‘lgan raqam bo‘lishi kerak.")
-    await state.update_data(age=int(message.text))
+    age = int(message.text)
+    await state.update_data(age=age)
+    await db_execute("UPDATE users SET age=? WHERE tg_id=?", (age, message.from_user.id))
     await state.set_state(Application.specialty)
     await send_specialty_picker(message)
 
@@ -886,6 +894,7 @@ async def app_phone_contact(message: Message, state: FSMContext):
     if message.contact.user_id and message.contact.user_id != message.from_user.id:
         return await message.answer("Iltimos, aynan o‘zingizning kontaktingizni yuboring.")
     await state.update_data(phone=message.contact.phone_number)
+    await db_execute("UPDATE users SET phone=? WHERE tg_id=?", (message.contact.phone_number, message.from_user.id))
     await state.set_state(Application.portfolio)
     await message.answer("Portfolio havolasi/matnini yozing yoki PDF/DOCX fayl yuboring:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="⬅️ Ortga", callback_data="formback:phone")
@@ -901,6 +910,7 @@ async def app_phone_back(message: Message, state: FSMContext):
 @router.message(Application.phone, F.text)
 async def app_phone_text(message: Message, state: FSMContext):
     await state.update_data(phone=message.text)
+    await db_execute("UPDATE users SET phone=? WHERE tg_id=?", (message.text, message.from_user.id))
     await state.set_state(Application.portfolio)
     await message.answer("Portfolio havolasi/matnini yozing yoki PDF/DOCX fayl yuboring:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="⬅️ Ortga", callback_data="formback:phone")
@@ -911,6 +921,9 @@ async def app_phone_text(message: Message, state: FSMContext):
 async def app_portfolio(message: Message, state: FSMContext):
     await state.update_data(portfolio=message.text, portfolio_file_id=None,
                             portfolio_file_name=None, portfolio_file_mime=None)
+    await db_execute("""UPDATE users SET portfolio=?,portfolio_file_id=NULL,
+      portfolio_file_name=NULL,portfolio_file_mime=NULL WHERE tg_id=?""",
+      (message.text, message.from_user.id))
     await state.set_state(Application.about)
     await message.answer("O‘zingiz haqingizda yozing (hajm cheklanmagan):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="⬅️ Ortga", callback_data="formback:portfolio")
@@ -927,6 +940,9 @@ async def app_portfolio_document(message: Message, state: FSMContext):
         return await message.answer("Faqat PDF yoki DOCX formatidagi portfolio faylini yuboring.")
     await state.update_data(portfolio=None, portfolio_file_id=document.file_id,
                             portfolio_file_name=filename, portfolio_file_mime=document.mime_type)
+    await db_execute("""UPDATE users SET portfolio=NULL,portfolio_file_id=?,
+      portfolio_file_name=?,portfolio_file_mime=? WHERE tg_id=?""",
+      (document.file_id, filename, document.mime_type, message.from_user.id))
     await state.set_state(Application.about)
     await message.answer(f"✅ <b>{h(filename, 200)}</b> qabul qilindi.\n\nO‘zingiz haqingizda yozing (hajm cheklanmagan):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="⬅️ Ortga", callback_data="formback:portfolio")
@@ -936,6 +952,7 @@ async def app_portfolio_document(message: Message, state: FSMContext):
 @router.message(Application.about, F.text)
 async def app_about(message: Message, state: FSMContext):
     await state.update_data(about=message.text)
+    await db_execute("UPDATE users SET about=? WHERE tg_id=?", (message.text, message.from_user.id))
     await state.set_state(Application.confirm)
     data = await state.get_data()
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✏️ Tahrirlash", callback_data="app:edit"),
@@ -951,13 +968,26 @@ async def app_edit(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@router.callback_query(Application.confirm, F.data == "app:send")
+@router.callback_query(F.data == "app:send")
 async def app_send(call: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
-    current = await db_one("SELECT status FROM users WHERE tg_id=?", (call.from_user.id,))
+    current = await db_one("SELECT * FROM users WHERE tg_id=?", (call.from_user.id,))
     if current and current["status"] in {"pending", "accepted"}:
         await state.clear()
         return await call.answer("Ariza qayta yuborilishi mumkin emas", show_alert=True)
+    if current:
+        for field in ("full_name", "age", "specialty", "phone", "portfolio", "portfolio_file_id",
+                      "portfolio_file_name", "portfolio_file_mime", "about"):
+            if data.get(field) is None and current[field] is not None:
+                data[field] = current[field]
+    required = ("full_name", "age", "specialty", "phone", "about")
+    if any(data.get(field) in (None, "") for field in required):
+        await state.clear()
+        await call.message.edit_reply_markup(reply_markup=None)
+        await call.answer("Forma ma’lumotlari yetarli emas", show_alert=True)
+        return await call.message.answer("Forma sessiyasi yangilangan. Iltimos, arizani boshidan qayta to‘ldiring.",
+                                         reply_markup=main_kb(False, show_application=True))
+    await call.answer("Ariza yuborilmoqda…")
     await db_execute("""UPDATE users SET username=?,full_name=?,age=?,phone=?,portfolio=?,portfolio_file_id=?,
       portfolio_file_name=?,portfolio_file_mime=?,about=?,status='pending',rejected_at=NULL WHERE tg_id=?""",
       (call.from_user.username, data["full_name"], data["age"], data["phone"], data.get("portfolio"),
@@ -984,12 +1014,12 @@ async def app_send(call: CallbackQuery, state: FSMContext, bot: Bot):
     await call.message.edit_reply_markup(reply_markup=None)
     await call.message.answer("✅ Arizangiz yuborildi." if delivered else "⚠️ Ariza saqlandi, ammo mas’ullarga xabar yetkazilmadi.",
                               reply_markup=main_kb(False, show_application=False))
-    await state.clear(); await call.answer()
+    await state.clear()
 
 
 @router.callback_query(F.data.startswith("review:"))
 async def review(call: CallbackQuery, bot: Bot):
-    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    if not await is_actual_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
     _, action, raw_id = call.data.split(":"); uid = int(raw_id)
     current = await db_one("SELECT status,full_name FROM users WHERE tg_id=?", (uid,))
     if not current: return await call.answer("User topilmadi", show_alert=True)
@@ -1075,7 +1105,7 @@ async def pending_keyboard(page=0):
 
 @router.callback_query(F.data.startswith("pending:"))
 async def pending_list(call: CallbackQuery):
-    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    if not await is_actual_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
     page = int(call.data.split(":")[1]); kb, total = await pending_keyboard(page)
     text = f"<b>⏳ Kutilayotgan arizalar</b> — {total} ta"
     if not total: text += "\n\nHozircha yangi ariza yo‘q."
@@ -1084,7 +1114,7 @@ async def pending_list(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("pendingview:"))
 async def pending_detail(call: CallbackQuery):
-    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    if not await is_actual_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
     _, raw_uid, page = call.data.split(":"); uid = int(raw_uid)
     u = await db_one("SELECT * FROM users WHERE tg_id=? AND status='pending'", (uid,))
     if not u: return await call.answer("Ariza allaqachon ko‘rib chiqilgan", show_alert=True)
@@ -1104,16 +1134,18 @@ async def users_list(message: Message):
     await show_team_categories(message)
 
 
-async def team_counts():
+async def team_counts(viewer_id: int):
+    can_see_superadmins = await role_of(viewer_id) == "superadmin"
+    developer_where = "status='accepted' AND role IN ('user','superadmin')" if can_see_superadmins else "role='user' AND status='accepted'"
     return await db_one("""SELECT
       COUNT(*) FILTER (WHERE role='admin') admins,
       COUNT(*) FILTER (WHERE role='manager') managers,
-      COUNT(*) FILTER (WHERE role='user' AND status='accepted') developers
+      COUNT(*) FILTER (WHERE """ + developer_where + """) developers
       FROM users""")
 
 
 async def show_team_categories(message, edit=False):
-    counts=await team_counts()
+    counts=await team_counts(message.chat.id)
     kb=InlineKeyboardMarkup(inline_keyboard=[
       [InlineKeyboardButton(text=f"🛡 Adminlar ({counts['admins'] or 0})",callback_data="teamlist:admin")],
       [InlineKeyboardButton(text=f"🧑‍💼 Managerlar ({counts['managers'] or 0})",callback_data="teamlist:manager")],
@@ -1137,7 +1169,9 @@ async def team_list_callback(call:CallbackQuery):
     category=call.data.split(':',1)[1]
     if category=='admin':where="role='admin'";title="🛡 Adminlar"
     elif category=='manager':where="role='manager'";title="🧑‍💼 Managerlar"
-    elif category=='developer':where="role='user' AND status='accepted'";title="💻 Dasturchilar"
+    elif category=='developer':
+        where="status='accepted' AND role IN ('user','superadmin')" if await role_of(call.from_user.id)=='superadmin' else "role='user' AND status='accepted'"
+        title="💻 Dasturchilar"
     else:return await call.answer("Bo‘lim topilmadi",show_alert=True)
     rows=await db_all(f"SELECT tg_id,full_name,specialty,status FROM users WHERE {where} ORDER BY full_name LIMIT 100")
     b=InlineKeyboardBuilder()
@@ -1150,7 +1184,7 @@ async def team_list_callback(call:CallbackQuery):
 async def team_user_detail(call:CallbackQuery):
     if not await is_staff(call.from_user.id):return await call.answer("Ruxsat yo‘q",show_alert=True)
     _,raw_uid,category=call.data.split(':');u=await db_one("SELECT * FROM users WHERE tg_id=?",(int(raw_uid),))
-    if not u or u['role']=='superadmin':return await call.answer("User topilmadi",show_alert=True)
+    if not u or (u['role']=='superadmin' and await role_of(call.from_user.id)!='superadmin'):return await call.answer("User topilmadi",show_alert=True)
     text=(f"<b>👤 {h(u['full_name'],200)}</b>\n\n🎂 Yosh: {h(u['age'] or '—',20)}\n🆔 ID: <code>{u['tg_id']}</code>\n"
           f"🔗 Username: @{h(u['username'] or '—',80)}\n☎️ Telefon: {h(u['phone'] or '—',100)}\n"
           f"🛡 Vakolat: {ROLE_LABELS[u['role']]}\n💼 Yo‘nalish: {SPECIALTIES.get(u['specialty'],'Tanlanmagan')}\n"
@@ -1203,7 +1237,7 @@ async def user_task_history(call:CallbackQuery):
 
 @router.callback_query(F.data.startswith("portfolio:"))
 async def send_portfolio_file(call: CallbackQuery, bot: Bot):
-    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    if not await is_actual_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
     uid = int(call.data.split(":", 1)[1])
     user = await db_one("SELECT * FROM users WHERE tg_id=?", (uid,))
     if not user or not user["portfolio_file_id"]: return await call.answer("Portfolio fayli topilmadi", show_alert=True)
