@@ -1904,7 +1904,11 @@ async def task_desc(message: Message, state: FSMContext):
 
 async def ask_task_deadline(message):
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏰ 1 soat",callback_data="deadline:1h"),InlineKeyboardButton(text="Bugun 18:00",callback_data="deadline:today18")],[InlineKeyboardButton(text="Ertaga 18:00",callback_data="deadline:tomorrow18"),InlineKeyboardButton(text="7 kun",callback_data="deadline:7d")],[InlineKeyboardButton(text="🏠 Bosh sahifa",callback_data="nav:home",design_key="home")]])
-    await message.answer("Muddatni tanlang yoki <code>30.07.2026 18:00</code> formatida yozing:",reply_markup=kb)
+    await message.answer(
+        "Muddatni tanlang yoki sana va vaqtni 24 soatlik formatda yozing:\n"
+        "<code>30.07.2026 18:00</code>",
+        reply_markup=kb,
+    )
 
 
 def parse_deadline(value):
@@ -1914,8 +1918,14 @@ def parse_deadline(value):
     except ValueError:return None
 
 
+def format_deadline(value):
+    weekdays = ("Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba")
+    local = value.astimezone(TASHKENT_TZ)
+    return f"{weekdays[local.weekday()]}, {local:%d.%m.%Y %H:%M}"
+
+
 async def finish_deadline(message,state,display,deadline_at):
-    users_count=(await db_one("SELECT COUNT(*) c FROM users WHERE status='accepted' AND (role='user' OR (role='superadmin' AND active_mode='user'))"))["c"]
+    users_count=(await db_one("SELECT COUNT(*) c FROM users WHERE status='accepted' AND (role='user' OR specialty IS NOT NULL)"))["c"]
     if not users_count:await state.clear();return await message.answer("Qabul qilingan userlar yo‘q.")
     await state.update_data(deadline=display,deadline_at=deadline_at.isoformat(timespec="seconds"),selected=[]);await state.set_state(TaskForm.selection_mode)
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👤 Bitta user",callback_data="selectmode:single")],[InlineKeyboardButton(text="👥 Bir nechta user",callback_data="selectmode:multiple")],[InlineKeyboardButton(text="🏠 Bosh sahifa",callback_data="nav:home",design_key="home")]])
@@ -1929,12 +1939,12 @@ async def deadline_shortcut(call:CallbackQuery,state:FSMContext):
     elif key=='7d':target=now+timedelta(days=7)
     elif key=='today18':target=now.replace(hour=18,minute=0,second=0,microsecond=0);target=target if target>now else target+timedelta(days=1)
     else:target=(now+timedelta(days=1)).replace(hour=18,minute=0,second=0,microsecond=0)
-    await call.message.edit_reply_markup(reply_markup=None);await finish_deadline(call.message,state,target.strftime('%d.%m.%Y %H:%M'),target.astimezone(timezone.utc));await call.answer()
+    await call.message.edit_reply_markup(reply_markup=None);await finish_deadline(call.message,state,format_deadline(target),target.astimezone(timezone.utc));await call.answer()
 
 
 async def user_picker(selected: set[int], selection_mode="multiple"):
     users = await db_all("""SELECT tg_id,full_name,username,specialty FROM users WHERE status='accepted'
-      AND (role='user' OR (role='superadmin' AND active_mode='user')) ORDER BY full_name""")
+      AND (role='user' OR specialty IS NOT NULL) ORDER BY full_name""")
     b = InlineKeyboardBuilder()
     for u in users:
         mark = "🔘" if selection_mode == "single" and u["tg_id"] in selected else ("✅" if u["tg_id"] in selected else "▫️")
@@ -1947,8 +1957,8 @@ async def user_picker(selected: set[int], selection_mode="multiple"):
 @router.message(TaskForm.deadline, F.text)
 async def task_deadline(message: Message, state: FSMContext):
     parsed=parse_deadline(message.text)
-    if not parsed or parsed<=datetime.now(timezone.utc):return await message.answer("Kelajakdagi vaqtni <code>30.07.2026 18:00</code> formatida yozing.")
-    await finish_deadline(message,state,message.text,parsed)
+    if not parsed or parsed<=datetime.now(timezone.utc):return await message.answer("Kelajakdagi sana va vaqtni 24 soatlik <code>30.07.2026 18:00</code> formatida yozing.")
+    await finish_deadline(message,state,format_deadline(parsed),parsed)
 
 
 @router.callback_query(TaskForm.selection_mode, F.data.startswith("selectmode:"))
