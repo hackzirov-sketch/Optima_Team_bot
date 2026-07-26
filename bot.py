@@ -56,6 +56,8 @@ router = Router()
 
 
 class Application(StatesGroup):
+    full_name = State()
+    age = State()
     specialty = State()
     phone = State()
     portfolio = State()
@@ -233,7 +235,7 @@ async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript("""
         CREATE TABLE IF NOT EXISTS users(
-          tg_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT NOT NULL,
+          tg_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT NOT NULL, age INTEGER,
           phone TEXT, portfolio TEXT, portfolio_file_id TEXT,
           portfolio_file_name TEXT, portfolio_file_mime TEXT, about TEXT,
           role TEXT NOT NULL DEFAULT 'user', status TEXT NOT NULL DEFAULT 'draft',
@@ -268,6 +270,8 @@ async def init_db():
             await db.execute("ALTER TABLE users ADD COLUMN portfolio_file_name TEXT")
         if "portfolio_file_mime" not in user_columns:
             await db.execute("ALTER TABLE users ADD COLUMN portfolio_file_mime TEXT")
+        if "age" not in user_columns:
+            await db.execute("ALTER TABLE users ADD COLUMN age INTEGER")
         columns = {row[1] for row in await (await db.execute("PRAGMA table_info(task_users)")).fetchall()}
         if "status" not in columns:
             await db.execute("ALTER TABLE task_users ADD COLUMN status TEXT NOT NULL DEFAULT 'assigned'")
@@ -290,7 +294,7 @@ async def init_db():
 
 async def ensure_user(tg_user):
     await db_execute("""INSERT INTO users(tg_id,username,full_name) VALUES(?,?,?)
-      ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username,full_name=excluded.full_name""",
+      ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username""",
       (tg_user.id, tg_user.username, tg_user.full_name))
 
 
@@ -395,13 +399,13 @@ def menu_texts(label):
 
 def app_text(data, user=None):
     username = (user.username if user else None) or data.get("username") or "yo‘q"
-    full_name = (user.full_name if user else None) or data.get("full_name", "")
+    full_name = data.get("full_name") or (user.full_name if user else None) or ""
     specialty = SPECIALTIES.get(data.get("specialty"), "Tanlanmagan")
     suffix = "\n\n<i>Uzun matn admin paneldagi user kartasida saqlandi.</i>" if len(str(data.get("portfolio", ""))) > 1200 or len(str(data.get("about", ""))) > 2100 else ""
     portfolio = data.get("portfolio") or "—"
     if data.get("portfolio_file_id"):
         portfolio = f"📎 {data.get('portfolio_file_name') or 'Portfolio fayli'} (PDF/DOCX)"
-    return (f"<b>Ariza</b>\n\n👤 {h(full_name, 200)}\n💼 {h(specialty, 100)}\n🔗 @{h(username, 100)}\n☎️ {h(data.get('phone'), 100)}\n"
+    return (f"<b>Ariza</b>\n\n👤 {h(full_name, 200)}\n🎂 {h(data.get('age') or '—', 20)} yosh\n💼 {h(specialty, 100)}\n🔗 @{h(username, 100)}\n☎️ {h(data.get('phone'), 100)}\n"
             f"💼 <b>Portfolio:</b>\n{h(portfolio, 1200)}\n\n🗒 <b>O‘zi haqida:</b>\n{h(data.get('about'), 2100)}{suffix}")
 
 
@@ -429,6 +433,7 @@ async def send_specialty_picker(message):
          InlineKeyboardButton(text="🎨 Frontend", callback_data="specialty:frontend", style="primary")],
         [InlineKeyboardButton(text="🧩 Full stack", callback_data="specialty:fullstack", style="success"),
          InlineKeyboardButton(text="✨ Vibecoder", callback_data="specialty:vibecoder", style="success")],
+        [InlineKeyboardButton(text="⬅️ Ortga", callback_data="formback:age")],
     ])
     await message.answer("<b>💼 Kasbiy yo‘nalishingizni tanlang:</b>", reply_markup=kb)
 
@@ -446,7 +451,8 @@ async def select_specialty(call: CallbackQuery, state: FSMContext):
 
 async def ask_phone(message, state):
     await state.set_state(Application.phone)
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)]],
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)],
+                                       [KeyboardButton(text="⬅️ Ortga")]],
                              resize_keyboard=True, one_time_keyboard=True)
     await message.answer("Telefon raqamingizni yuboring yoki matn ko‘rinishida yozing:", reply_markup=kb)
 
@@ -480,6 +486,7 @@ async def admins_markup():
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Admin tayinlash", callback_data="admin:add", style="success")],
         [InlineKeyboardButton(text="➖ Adminni olib tashlash", callback_data="admin:remove", style="danger")],
+        [InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="nav:home")],
     ])
     return "\n".join(lines), kb
 
@@ -556,6 +563,7 @@ def design_catalog_keyboard(page=0):
     nav.append(AiogramInlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="noop"))
     if page + 1 < pages: nav.append(AiogramInlineKeyboardButton(text="➡️", callback_data=f"design:list:{page+1}"))
     rows.append(nav)
+    rows.append([AiogramInlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="nav:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows), page
 
 
@@ -713,9 +721,56 @@ async def application_start(message: Message, state: FSMContext):
     if current and current["status"] == "blocked":
         return await message.answer("⛔ Profilingiz admin tomonidan vaqtincha bloklangan.")
     await state.clear()
-    await state.update_data(username=message.from_user.username, full_name=message.from_user.full_name)
+    await state.update_data(username=message.from_user.username)
+    await state.set_state(Application.full_name)
+    await message.answer("Ism va familiyangizni kiriting:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="nav:home")
+    ]]))
+
+
+@router.message(Application.full_name, F.text)
+async def app_full_name(message: Message, state: FSMContext):
+    full_name = " ".join(message.text.split())
+    if len(full_name.split()) < 2:
+        return await message.answer("Ism va familiyani to‘liq kiriting. Masalan: Ali Valiyev")
+    await state.update_data(full_name=full_name)
+    await state.set_state(Application.age)
+    await message.answer("Yoshingizni raqam bilan kiriting (14–100):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⬅️ Ortga", callback_data="formback:full_name")
+    ]]))
+
+
+@router.message(Application.age, F.text)
+async def app_age(message: Message, state: FSMContext):
+    if not message.text.isdigit() or not 14 <= int(message.text) <= 100:
+        return await message.answer("Yosh 14 dan 100 gacha bo‘lgan raqam bo‘lishi kerak.")
+    await state.update_data(age=int(message.text))
     await state.set_state(Application.specialty)
     await send_specialty_picker(message)
+
+
+@router.callback_query(F.data.startswith("formback:"))
+async def application_back(call: CallbackQuery, state: FSMContext):
+    target = call.data.split(":", 1)[1]
+    if target == "full_name":
+        await state.set_state(Application.full_name)
+        await call.message.edit_text("Ism va familiyangizni qayta kiriting:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="nav:home")
+        ]]))
+    elif target == "age":
+        await state.set_state(Application.age)
+        await call.message.edit_text("Yoshingizni raqam bilan kiriting (14–100):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ Ortga", callback_data="formback:full_name")
+        ]]))
+    elif target == "phone":
+        await state.set_state(Application.phone)
+        await ask_phone(call.message, state)
+    elif target == "portfolio":
+        await state.set_state(Application.portfolio)
+        await call.message.edit_text("Portfolio havolasi/matnini yozing yoki PDF/DOCX fayl yuboring:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⬅️ Ortga", callback_data="formback:phone")
+        ]]))
+    await call.answer()
 
 
 @router.message(Application.phone, F.contact)
@@ -724,14 +779,24 @@ async def app_phone_contact(message: Message, state: FSMContext):
         return await message.answer("Iltimos, aynan o‘zingizning kontaktingizni yuboring.")
     await state.update_data(phone=message.contact.phone_number)
     await state.set_state(Application.portfolio)
-    await message.answer("Portfolio havolasi/matnini yozing yoki PDF/DOCX fayl yuboring:", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Portfolio havolasi/matnini yozing yoki PDF/DOCX fayl yuboring:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⬅️ Ortga", callback_data="formback:phone")
+    ]]))
+
+
+@router.message(Application.phone, F.text.in_(menu_texts("⬅️ Ortga")))
+async def app_phone_back(message: Message, state: FSMContext):
+    await state.set_state(Application.specialty)
+    await send_specialty_picker(message)
 
 
 @router.message(Application.phone, F.text)
 async def app_phone_text(message: Message, state: FSMContext):
     await state.update_data(phone=message.text)
     await state.set_state(Application.portfolio)
-    await message.answer("Portfolio havolasi/matnini yozing yoki PDF/DOCX fayl yuboring:", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Portfolio havolasi/matnini yozing yoki PDF/DOCX fayl yuboring:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⬅️ Ortga", callback_data="formback:phone")
+    ]]))
 
 
 @router.message(Application.portfolio, F.text)
@@ -739,7 +804,9 @@ async def app_portfolio(message: Message, state: FSMContext):
     await state.update_data(portfolio=message.text, portfolio_file_id=None,
                             portfolio_file_name=None, portfolio_file_mime=None)
     await state.set_state(Application.about)
-    await message.answer("O‘zingiz haqingizda yozing (hajm cheklanmagan):")
+    await message.answer("O‘zingiz haqingizda yozing (hajm cheklanmagan):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⬅️ Ortga", callback_data="formback:portfolio")
+    ]]))
 
 
 @router.message(Application.portfolio, F.document)
@@ -753,7 +820,9 @@ async def app_portfolio_document(message: Message, state: FSMContext):
     await state.update_data(portfolio=None, portfolio_file_id=document.file_id,
                             portfolio_file_name=filename, portfolio_file_mime=document.mime_type)
     await state.set_state(Application.about)
-    await message.answer(f"✅ <b>{h(filename, 200)}</b> qabul qilindi.\n\nO‘zingiz haqingizda yozing (hajm cheklanmagan):")
+    await message.answer(f"✅ <b>{h(filename, 200)}</b> qabul qilindi.\n\nO‘zingiz haqingizda yozing (hajm cheklanmagan):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⬅️ Ortga", callback_data="formback:portfolio")
+    ]]))
 
 
 @router.message(Application.about, F.text)
@@ -777,9 +846,9 @@ async def app_edit(call: CallbackQuery, state: FSMContext):
 @router.callback_query(Application.confirm, F.data == "app:send")
 async def app_send(call: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
-    await db_execute("""UPDATE users SET username=?,full_name=?,phone=?,portfolio=?,portfolio_file_id=?,
+    await db_execute("""UPDATE users SET username=?,full_name=?,age=?,phone=?,portfolio=?,portfolio_file_id=?,
       portfolio_file_name=?,portfolio_file_mime=?,about=?,status='pending' WHERE tg_id=?""",
-      (call.from_user.username, call.from_user.full_name, data["phone"], data.get("portfolio"),
+      (call.from_user.username, data["full_name"], data["age"], data["phone"], data.get("portfolio"),
        data.get("portfolio_file_id"), data.get("portfolio_file_name"), data.get("portfolio_file_mime"),
        data["about"], call.from_user.id))
     staff = await db_all("SELECT tg_id FROM users WHERE role IN ('superadmin','admin','manager')")
@@ -822,10 +891,11 @@ async def users_keyboard(page=0):
     for u in rows:
         title = f"{u['full_name']} · {SPECIALTIES.get(u['specialty'], '—')} · {STATUS_LABELS[u['status']]}"
         b.button(text=title[:60], callback_data=f"usr:{u['tg_id']}:{page}")
+    b.button(text="⬅️ Admin panel", callback_data="menu:panel")
     if page: b.button(text="⬅️", callback_data=f"users:{page-1}")
     b.button(text=f"{page+1}/{pages}", callback_data="noop")
     if page + 1 < pages: b.button(text="➡️", callback_data=f"users:{page+1}")
-    b.adjust(*([1] * len(rows)), 3)
+    b.adjust(*([1] * len(rows)), 1, 3)
     return b.as_markup(), total
 
 
@@ -845,7 +915,8 @@ async def panel(message: Message):
     b.button(text="👥 Userlar", callback_data="users:0")
     b.button(text="📋 Topshiriqlar", callback_data="tasks:0")
     b.button(text="📂 Guruhlar", callback_data="groups:show")
-    b.adjust(2, 2)
+    b.button(text="⬅️ Bosh menyu", callback_data="nav:home")
+    b.adjust(2, 2, 1)
     await message.answer(f"<b>📊 Admin panel</b>\n\n👥 Jami: {stats['total']}\n⏳ Kutilmoqda: {stats['pending'] or 0}\n✅ Qabul qilingan: {stats['accepted'] or 0}\n🧑‍💼 Managerlar: {stats['managers'] or 0}\n📂 Guruhlar: {groups}\n📌 Topshiriqlar: {tasks}\n☑️ Bajarilish: {completion['done'] or 0}/{completion['total'] or 0}", reply_markup=b.as_markup())
 
 
@@ -856,10 +927,11 @@ async def pending_keyboard(page=0):
     b = InlineKeyboardBuilder()
     for u in rows:
         b.button(text=f"📝 {u['full_name'][:48]}", callback_data=f"pendingview:{u['tg_id']}:{page}")
+    b.button(text="⬅️ Admin panel", callback_data="menu:panel")
     if page: b.button(text="⬅️", callback_data=f"pending:{page-1}")
     b.button(text=f"{page+1}/{pages}", callback_data="noop")
     if page + 1 < pages: b.button(text="➡️", callback_data=f"pending:{page+1}")
-    b.adjust(*([1] * len(rows)), 3)
+    b.adjust(*([1] * len(rows)), 1, 3)
     return b.as_markup(), total
 
 
@@ -914,7 +986,7 @@ async def user_detail(call: CallbackQuery):
     if u["portfolio_file_id"]:
         b.button(text="📎 Portfolio faylini ochish", callback_data=f"portfolio:{u['tg_id']}")
     b.button(text="⬅️ Ro‘yxat", callback_data=f"users:{raw_page}"); b.adjust(1)
-    text = (f"<b>{h(u['full_name'], 200)}</b>\nID: <code>{u['tg_id']}</code>\nUsername: @{h(u['username'] or '-', 100)}\n"
+    text = (f"<b>{h(u['full_name'], 200)}</b>\n🎂 Yosh: {h(u['age'] or '—', 20)}\nID: <code>{u['tg_id']}</code>\nUsername: @{h(u['username'] or '-', 100)}\n"
             f"Telefon: {h(u['phone'] or '-', 100)}\nVakolat: {ROLE_LABELS[u['role']]}\nYo‘nalish: {SPECIALTIES.get(u['specialty'], 'Tanlanmagan')}\nHolat: {STATUS_LABELS[u['status']]}\n\n"
             f"<b>Portfolio:</b>\n{h(u['portfolio'] or '-', 1200)}\n\n<b>O‘zi haqida:</b>\n{h(u['about'] or '-', 2100)}")
     await call.message.edit_text(text, reply_markup=b.as_markup()); await call.answer()
@@ -978,6 +1050,16 @@ async def inline_main_menu(call: CallbackQuery, state: FSMContext):
     if action == "switch_role": return await change_mode(actor_message)
 
 
+@router.callback_query(F.data == "nav:home")
+async def navigate_home(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    role = await effective_role(call.from_user.id)
+    actor_message = call.message.model_copy(update={"from_user": call.from_user})
+    with suppress(TelegramBadRequest): await call.message.edit_reply_markup(reply_markup=None)
+    await send_main_menu(actor_message, role in {"superadmin", "admin", "manager"}, role == "superadmin")
+    await call.answer()
+
+
 @router.message(Command("register_group"))
 async def register_group(message: Message):
     if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}: return await message.answer("Bu buyruqni guruhda yuboring.")
@@ -1019,7 +1101,8 @@ async def groups_view(admin=False):
     if admin:
         for g in groups:
             b.button(text=f"🗑 {g['title'][:45]}", callback_data=f"groupdel:{g['chat_id']}")
-    b.button(text="🔄 Yangilash", callback_data="groups:show"); b.adjust(1)
+    b.button(text="🔄 Yangilash", callback_data="groups:show")
+    b.button(text="⬅️ Admin panel", callback_data="menu:panel"); b.adjust(1)
     return text, b.as_markup()
 
 
@@ -1157,10 +1240,11 @@ async def tasks_keyboard(page=0):
     b = InlineKeyboardBuilder()
     for task in rows:
         b.button(text=f"#{task['id']} · {task['name'][:35]} · {task['done'] or 0}/{task['total']}", callback_data=f"taskview:{task['id']}:{page}")
+    b.button(text="⬅️ Admin panel", callback_data="menu:panel")
     if page: b.button(text="⬅️", callback_data=f"tasks:{page-1}")
     b.button(text=f"{page+1}/{pages}", callback_data="noop")
     if page + 1 < pages: b.button(text="➡️", callback_data=f"tasks:{page+1}")
-    b.adjust(*([1] * len(rows)), 3)
+    b.adjust(*([1] * len(rows)), 1, 3)
     return b.as_markup(), total
 
 
