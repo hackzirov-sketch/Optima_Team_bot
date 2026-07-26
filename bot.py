@@ -159,6 +159,8 @@ BUTTON_CATALOG = [
     ("tasks", "📋 Topshiriqlar"), ("groups", "📂 Guruhlar"),
     ("admins", "🛡 Adminlar"), ("button_design", "🎨 Tugma dizayni"),
     ("message_emoji_design", "✨ Xabar emojilari"), ("message_templates", "📝 Xabar matnlari"),
+    ("home", "🏠 Bosh sahifa"), ("design_list", "🎨 Tugmalar ro‘yxati"),
+    ("save", "💾 Saqlash"), ("reset_default", "♻️ Standartga qaytarish"),
     ("switch_role", "🔄 Rolni almashtirish"), ("superadmin", "👑 Superadmin"),
     ("admin", "🛡 Admin"), ("user", "👤 User"),
     ("backend", "⚙️ Backend"), ("frontend", "🎨 Frontend"),
@@ -177,6 +179,18 @@ BUTTON_CATALOG = [
     ("open_applications", "📂 Arizalar bo‘limini ochish"), ("view_application", "📝 Arizani ko‘rish"),
     ("submit_result", "📤 Natija topshirish"), ("approve_result", "✅ Tasdiqlash"),
     ("rework", "🔁 Qayta ishlash"), ("save_template", "🧾 Shablon sifatida saqlash"),
+    ("pending_applications", "⏳ Arizalar"), ("pending_status", "⏳ Kutilmoqda"),
+    ("accepted_status", "✅ Qabul qilingan"), ("blocked_status", "⛔ Bloklangan"),
+    ("confirm_yes", "✅ Ha, tasdiqlayman"), ("confirm_remove", "✅ Ha, olib tashlash"),
+    ("confirm_no", "❌ Yo‘q"), ("single_user", "👤 Bitta user"),
+    ("multiple_users", "👥 Bir nechta user"), ("ask_question", "💬 Savol berish"),
+    ("answer_question", "💬 Javob berish"), ("portfolio_file", "📄 Portfolio faylini ko‘rish"),
+    ("open_portfolio", "📎 Portfolio faylini ochish"), ("edit_phone", "☎️ Telefon"),
+    ("edit_portfolio", "💼 Portfolio"), ("edit_about", "🗒 O‘zim haqimda"),
+    ("edit_specialty", "💼 Yo‘nalishni o‘zgartirish"), ("deadline_1h", "⏰ 1 soat"),
+    ("deadline_today", "Bugun 18:00"), ("deadline_tomorrow", "Ertaga 18:00"),
+    ("deadline_week", "7 kun"), ("premium_emoji", "✨ Premium emojini yuborish"),
+    ("unicode_fallback", "🙂 Unicode fallback"),
     ("back", "⬅️ Orqaga"), ("previous", "⬅️"), ("next", "➡️"),
 ]
 BUTTON_LABELS = dict(BUTTON_CATALOG)
@@ -187,6 +201,8 @@ def infer_button_key(text: str):
     for key, label in BUTTON_CATALOG:
         if clean == label or clean.startswith(label + " "):
             return key
+    if "Bosh menyu" in clean or "Bosh sahifa" in clean: return "home"
+    if "Ro‘yxat" in clean or "Qayta tanlash" in clean: return "design_list"
     if clean.startswith("⬅️"): return "back"
     if clean.startswith("✅ Faollashtirish"): return "activate"
     if clean.startswith("⛔ Bloklash"): return "block"
@@ -497,21 +513,11 @@ def kb_button(text, **kwargs):
 
 
 def main_kb(staff=False, superadmin=False, show_application=True, accepted_user=False):
-    rows = []
-    if not staff and show_application:
-        rows.append([kb_button("📝 Ariza to‘ldirish")])
-    if not staff and accepted_user:
-        rows += [[kb_button("📥 Vazifalar"), kb_button("✅ Tugallangan vazifalarim")], [kb_button("👤 Profilim")]]
-    if staff:
-        rows += [[kb_button("📊 Admin panel")],
-                 [kb_button("➕ Topshiriq"), kb_button("📋 Topshiriqlar")],
-                 [kb_button("📂 Guruhlar")]]
+    rows = [[kb_button("🔄 Yangilash", design_key="refresh")]]
     if superadmin:
-        rows += [[kb_button("🛡 Adminlar"), kb_button("🎨 Tugma dizayni")],
-                 [kb_button("✨ Xabar emojilari")],
-                 [kb_button("📝 Xabar matnlari")],
-                 [kb_button("🔄 Rolni almashtirish")]]
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True) if rows else ReplyKeyboardRemove()
+        rows = [[kb_button("🔄 Rolni almashtirish", design_key="switch_role"),
+                 kb_button("🔄 Yangilash", design_key="refresh")]]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def main_inline_kb(staff=False, superadmin=False, show_application=True, accepted_user=False):
@@ -546,13 +552,21 @@ async def send_main_menu(message, staff=False, superadmin=False):
     accepted_user = not staff and status == "accepted"
     private = message.chat.type == ChatType.PRIVATE
     if private:
-        await message.answer("⌨️ Pastki menyu ham faol.", reply_markup=main_kb(staff, superadmin, show_application, accepted_user))
+        actual_superadmin = await role_of(message.from_user.id) == "superadmin"
+        await message.answer("🔄 Pastdagi Yangilash tugmasi menyuni qayta ochadi.", reply_markup=main_kb(staff, actual_superadmin, show_application, accepted_user))
     await message.answer("Kerakli bo‘limni tanlang:", reply_markup=main_inline_kb(staff, superadmin, show_application, accepted_user))
 
 
 def menu_texts(label):
     _icon, separator, plain = label.partition(" ")
     return {label, plain if separator else label}
+
+
+@router.message(F.text.in_(menu_texts("🔄 Yangilash")))
+async def refresh_main_menu(message:Message,state:FSMContext):
+    await state.clear();await load_design()
+    role=await effective_role(message.from_user.id)
+    await send_main_menu(message,role in {"superadmin","admin","manager"},role=="superadmin")
 
 
 def app_text(data, user=None):
@@ -657,7 +671,7 @@ async def admins_markup():
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Admin tayinlash", callback_data="admin:add", style="success")],
         [InlineKeyboardButton(text="➖ Adminni olib tashlash", callback_data="admin:remove", style="danger")],
-        [InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="nav:home")],
+        [InlineKeyboardButton(text="🏠 Bosh sahifa", callback_data="nav:home", design_key="home")],
     ])
     return "\n".join(lines), kb
 
@@ -739,24 +753,23 @@ def design_catalog_keyboard(page=0):
     rows = []
     page_buttons = []
     for key, label in BUTTON_CATALOG[page * page_size:(page + 1) * page_size]:
-        cfg = DESIGN["button_designs"].get(key, {})
-        style_icon = {"primary": "🔵", "success": "🟢", "danger": "🔴"}.get(cfg.get("style"), "⚪")
-        emoji_icon = "✨" if cfg.get("emoji_id") else ""
-        page_buttons.append(AiogramInlineKeyboardButton(text=f"{style_icon}{emoji_icon} {label}", callback_data=f"design:button:{key}"))
+        style, emoji = button_appearance(label, key)
+        page_buttons.append(AiogramInlineKeyboardButton(text=button_label(label, emoji), callback_data=f"design:button:{key}",
+                                                        style=style, icon_custom_emoji_id=emoji))
     rows.extend(page_buttons[index:index + 2] for index in range(0, len(page_buttons), 2))
     nav = []
-    if page: nav.append(AiogramInlineKeyboardButton(text="⬅️", callback_data=f"design:list:{page-1}"))
-    nav.append(AiogramInlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="noop"))
-    if page + 1 < pages: nav.append(AiogramInlineKeyboardButton(text="➡️", callback_data=f"design:list:{page+1}"))
+    if page: nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"design:list:{page-1}", design_key="previous"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="noop", design_key="design_list"))
+    if page + 1 < pages: nav.append(InlineKeyboardButton(text="➡️", callback_data=f"design:list:{page+1}", design_key="next"))
     rows.append(nav)
-    rows.append([AiogramInlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="nav:home")])
+    rows.append([InlineKeyboardButton(text="🏠 Bosh sahifa", callback_data="nav:home", design_key="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows), page
 
 
 async def show_design_catalog(target, page=0, edit=False):
     kb, page = design_catalog_keyboard(page)
     text = ("<b>🎨 Barcha tugmalar dizayni</b>\n\n"
-            "Sozlamoqchi bo‘lgan tugmani tanlang. ⚪ — global dizayn, rangli belgi — alohida dizayn, ✨ — premium emoji.")
+            "Har bir tugma quyida hozir saqlangan real rang va Premium emoji bilan ko‘rsatiladi. Sozlash uchun ustiga bosing.")
     if edit:
         await target.edit_text(text, reply_markup=kb)
     else:
@@ -781,17 +794,18 @@ async def design_choose_button(call: CallbackQuery, state: FSMContext):
     if not await require_superadmin(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
     key = call.data.rsplit(":", 1)[1]
     if key not in BUTTON_LABELS: return await call.answer("Tugma topilmadi", show_alert=True)
+    catalog_page = next(i for i, item in enumerate(BUTTON_CATALOG) if item[0] == key) // 7
     current = DESIGN["button_designs"].get(key, {})
     await state.update_data(design_key=key, design_style=current.get("style", DESIGN["button_style"]),
-                            design_emoji=current.get("emoji_id", DESIGN["premium_emoji_id"]))
+                            design_emoji=current.get("emoji_id", DESIGN["premium_emoji_id"]), design_page=catalog_page)
     rows = [[
         AiogramInlineKeyboardButton(text="⚪ Standart", callback_data="design:pickstyle:default"),
         AiogramInlineKeyboardButton(text="🔵 Ko‘k", callback_data="design:pickstyle:primary", style="primary"),
     ], [
         AiogramInlineKeyboardButton(text="🟢 Yashil", callback_data="design:pickstyle:success", style="success"),
         AiogramInlineKeyboardButton(text="🔴 Qizil", callback_data="design:pickstyle:danger", style="danger"),
-    ], [AiogramInlineKeyboardButton(text="♻️ Defaultga qaytarish", callback_data=f"design:reset:{key}", style="danger")],
-       [AiogramInlineKeyboardButton(text="⬅️ Ro‘yxat", callback_data="design:list:0")]]
+    ], [InlineKeyboardButton(text="♻️ Standartga qaytarish", callback_data=f"design:reset:{key}", design_key="reset_default")],
+       [InlineKeyboardButton(text="🎨 Tugmalar ro‘yxati", callback_data=f"design:list:{catalog_page}", design_key="design_list")]]
     await call.message.edit_text(f"<b>{h(BUTTON_LABELS[key])}</b>\n\n1/3 — Tugma rangini tanlang:",
                                  reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await call.answer()
@@ -833,8 +847,8 @@ async def show_design_preview(message, state):
     preview = AiogramInlineKeyboardButton(text=button_label(BUTTON_LABELS[key], emoji), callback_data="noop",
                                           style=None if style == "default" else style,
                                           icon_custom_emoji_id=emoji or None)
-    save = AiogramInlineKeyboardButton(text="💾 Saqlash", callback_data="design:save", style="success")
-    back = AiogramInlineKeyboardButton(text="⬅️ Qayta tanlash", callback_data=f"design:button:{key}")
+    save = InlineKeyboardButton(text="💾 Saqlash", callback_data="design:save", design_key="save")
+    back = InlineKeyboardButton(text="🎨 Tugmalar ro‘yxati", callback_data=f"design:button:{key}", design_key="design_list")
     await message.edit_text(f"<b>3/3 — Preview</b>\n\nRang: <code>{style}</code>\nEmoji: <code>{emoji or 'yo‘q'}</code>",
                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[preview], [save, back]]))
 
@@ -856,8 +870,8 @@ async def set_emoji(message: Message, state: FSMContext):
         preview = AiogramInlineKeyboardButton(text=button_label(BUTTON_LABELS[key], emoji_id), callback_data="noop",
                                               style=None if style == "default" else style,
                                               icon_custom_emoji_id=emoji_id)
-        save = AiogramInlineKeyboardButton(text="💾 Saqlash", callback_data="design:save", style="success")
-        back = AiogramInlineKeyboardButton(text="⬅️ Qayta tanlash", callback_data=f"design:button:{key}")
+        save = InlineKeyboardButton(text="💾 Saqlash", callback_data="design:save", design_key="save")
+        back = InlineKeyboardButton(text="🎨 Tugmalar ro‘yxati", callback_data=f"design:button:{key}", design_key="design_list")
         await message.answer(f"<b>3/3 — Preview</b>\n\nRang: <code>{style}</code>\nEmoji: <code>{emoji_id}</code>",
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=[[preview], [save, back]]))
     except TelegramBadRequest:
@@ -872,9 +886,10 @@ async def save_selected_design(call: CallbackQuery, state: FSMContext):
     key = data.get("design_key")
     if key not in BUTTON_LABELS: return await call.answer("Dizayn sessiyasi tugagan", show_alert=True)
     await save_button_design(key, data.get("design_style", "default"), data.get("design_emoji"))
+    page = int(data.get("design_page", 0))
     await state.clear()
     await call.answer("Dizayn saqlandi ✅", show_alert=True)
-    await show_design_catalog(call.message, edit=True)
+    await show_design_catalog(call.message, page=page, edit=True)
 
 
 @router.callback_query(F.data.startswith("design:reset:"))
@@ -885,9 +900,10 @@ async def reset_selected_design(call: CallbackQuery, state: FSMContext):
     designs = dict(DESIGN["button_designs"])
     designs.pop(key, None)
     await save_setting("button_designs", designs)
+    page = next(i for i, item in enumerate(BUTTON_CATALOG) if item[0] == key) // 7
     await state.clear()
     await call.answer("Default holat qaytarildi ✅", show_alert=True)
-    await show_design_catalog(call.message, edit=True)
+    await show_design_catalog(call.message, page=page, edit=True)
 
 
 def message_emoji_catalog_keyboard():
@@ -897,7 +913,7 @@ def message_emoji_catalog_keyboard():
         marker = "✨" if configured.get("custom_id") else (configured.get("text") or fallback)
         buttons.append(AiogramInlineKeyboardButton(text=f"{marker} {label}", callback_data=f"msgemoji:choose:{key}"))
     rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
-    rows.append([AiogramInlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="nav:home")])
+    rows.append([InlineKeyboardButton(text="🏠 Bosh sahifa", callback_data="nav:home", design_key="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -988,7 +1004,7 @@ async def message_emoji_reset(call: CallbackQuery, state: FSMContext):
 async def show_message_templates(target, edit=False):
     rows = [[InlineKeyboardButton(text=label, callback_data=f"msgtpl:choose:{key}")]
             for key, (label, _default) in MESSAGE_TEMPLATE_CATALOG.items()]
-    rows.append([InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="nav:home")])
+    rows.append([InlineKeyboardButton(text="🏠 Bosh sahifa", callback_data="nav:home", design_key="home")])
     text = ("<b>📝 Xabar matnlari</b>\n\nShablonni tanlang. Mavjud o‘zgaruvchilar: "
             "<code>{full_name}</code>, <code>{note}</code>, <code>{task_name}</code>, "
             "<code>{deadline}</code>, <code>{remaining}</code>.")
@@ -1073,7 +1089,7 @@ async def application_start(message: Message, state: FSMContext):
     await state.update_data(username=message.from_user.username)
     await state.set_state(Application.full_name)
     await message.answer("Ism va familiyangizni kiriting:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="nav:home")
+        InlineKeyboardButton(text="🏠 Bosh sahifa", callback_data="nav:home", design_key="home")
     ]]))
 
 
@@ -1107,7 +1123,7 @@ async def application_back(call: CallbackQuery, state: FSMContext):
     if target == "full_name":
         await state.set_state(Application.full_name)
         await call.message.edit_text("Ism va familiyangizni qayta kiriting:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="nav:home")
+            InlineKeyboardButton(text="🏠 Bosh sahifa", callback_data="nav:home", design_key="home")
         ]]))
     elif target == "age":
         await state.set_state(Application.age)
@@ -1353,7 +1369,7 @@ async def panel(message: Message):
     b.button(text="🕘 Audit", callback_data="menu:audit")
     b.button(text="👀 Natijalar",callback_data="submissions:show")
     b.button(text="📈 Kengaytirilgan statistika",callback_data="stats:v1")
-    b.button(text="⬅️ Bosh menyu", callback_data="nav:home")
+    b.button(text="🏠 Bosh sahifa", callback_data="nav:home", design_key="home")
     b.adjust(2, 2, 2, 2, 1)
     await message.answer(f"<b>📊 Admin panel</b>\n\n👥 Jami: {stats['total']}\n⏳ Kutilmoqda: {stats['pending'] or 0}\n✅ Qabul qilingan: {stats['accepted'] or 0}\n🧑‍💼 Managerlar: {stats['managers'] or 0}\n😴 7 kundan beri faol emas: {inactive}\n📂 Guruhlar: {groups}\n📌 Topshiriqlar: {tasks}\n☑️ Bajarilish: {completion['done'] or 0}/{completion['total'] or 0}\n\n<b>🏆 Eng faol userlar</b>\n{leaderboard}", reply_markup=b.as_markup())
 
@@ -1707,7 +1723,7 @@ async def show_profile(message: Message):
     done = (await db_one("SELECT COUNT(*) c FROM task_users WHERE user_id=? AND status IN ('approved','completed')", (message.from_user.id,)))["c"]
     text = (f"<b>👤 Profilim</b>\n\n<b>{h(u['full_name'],200)}</b>\n🎂 {h(u['age'] or '—',20)} yosh\n💼 {SPECIALTIES.get(u['specialty'],'Tanlanmagan')}\n"
             f"☎️ {h(u['phone'] or '—',100)}\n✅ Tugallangan vazifalar: {done}\n\n<b>Portfolio:</b> {h(u['portfolio'] or u['portfolio_file_name'] or '—',800)}\n\n<b>O‘zi haqida:</b> {h(u['about'] or '—',1400)}")
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="☎️ Telefon",callback_data="profileedit:phone"),InlineKeyboardButton(text="💼 Portfolio",callback_data="profileedit:portfolio")],[InlineKeyboardButton(text="🗒 O‘zim haqimda",callback_data="profileedit:about")],[InlineKeyboardButton(text="💼 Yo‘nalishni o‘zgartirish",callback_data="profile:specialty")],[InlineKeyboardButton(text="⬅️ Bosh menyu",callback_data="nav:home")]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="☎️ Telefon",callback_data="profileedit:phone"),InlineKeyboardButton(text="💼 Portfolio",callback_data="profileedit:portfolio")],[InlineKeyboardButton(text="🗒 O‘zim haqimda",callback_data="profileedit:about")],[InlineKeyboardButton(text="💼 Yo‘nalishni o‘zgartirish",callback_data="profile:specialty")],[InlineKeyboardButton(text="🏠 Bosh sahifa",callback_data="nav:home",design_key="home")]])
     await message.answer(text,reply_markup=kb)
 
 
@@ -1861,7 +1877,7 @@ async def task_desc(message: Message, state: FSMContext):
 
 
 async def ask_task_deadline(message):
-    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏰ 1 soat",callback_data="deadline:1h"),InlineKeyboardButton(text="Bugun 18:00",callback_data="deadline:today18")],[InlineKeyboardButton(text="Ertaga 18:00",callback_data="deadline:tomorrow18"),InlineKeyboardButton(text="7 kun",callback_data="deadline:7d")],[InlineKeyboardButton(text="⬅️ Bosh menyu",callback_data="nav:home")]])
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏰ 1 soat",callback_data="deadline:1h"),InlineKeyboardButton(text="Bugun 18:00",callback_data="deadline:today18")],[InlineKeyboardButton(text="Ertaga 18:00",callback_data="deadline:tomorrow18"),InlineKeyboardButton(text="7 kun",callback_data="deadline:7d")],[InlineKeyboardButton(text="🏠 Bosh sahifa",callback_data="nav:home",design_key="home")]])
     await message.answer("Muddatni tanlang yoki <code>30.07.2026 18:00</code> formatida yozing:",reply_markup=kb)
 
 
@@ -1876,7 +1892,7 @@ async def finish_deadline(message,state,display,deadline_at):
     users_count=(await db_one("SELECT COUNT(*) c FROM users WHERE status='accepted' AND (role='user' OR (role='superadmin' AND active_mode='user'))"))["c"]
     if not users_count:await state.clear();return await message.answer("Qabul qilingan userlar yo‘q.")
     await state.update_data(deadline=display,deadline_at=deadline_at.isoformat(timespec="seconds"),selected=[]);await state.set_state(TaskForm.selection_mode)
-    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👤 Bitta user",callback_data="selectmode:single")],[InlineKeyboardButton(text="👥 Bir nechta user",callback_data="selectmode:multiple")],[InlineKeyboardButton(text="⬅️ Bosh menyu",callback_data="nav:home")]])
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👤 Bitta user",callback_data="selectmode:single")],[InlineKeyboardButton(text="👥 Bir nechta user",callback_data="selectmode:multiple")],[InlineKeyboardButton(text="🏠 Bosh sahifa",callback_data="nav:home",design_key="home")]])
     await message.answer("Ijrochilarni tanlash turini belgilang:",reply_markup=kb)
 
 
@@ -2090,7 +2106,7 @@ async def my_tasks_markup(user_id: int, completed: bool):
     for task in rows:
         overdue = bool(task['deadline_at'] and utc_datetime(task['deadline_at']) < datetime.now(timezone.utc) and not completed)
         b.button(text=f"{'⚠️ Kechikkan' if overdue else TASK_STATUS_LABELS.get(task['status'],'')} · #{task['id']} · {task['name'][:30]}", callback_data=f"mytask:{task['id']}:{kind}")
-    b.button(text="⬅️ Bosh menyu", callback_data="nav:home")
+    b.button(text="🏠 Bosh sahifa", callback_data="nav:home", design_key="home")
     b.adjust(1)
     return b.as_markup(), len(rows)
 
