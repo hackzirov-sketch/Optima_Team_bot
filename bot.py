@@ -130,6 +130,7 @@ BUTTON_CATALOG = [
     ("my_tasks", "📥 Vazifalar"), ("my_completed_tasks", "✅ Tugallangan vazifalarim"),
     ("profile", "👤 Profilim"), ("search", "🔎 Qidiruv"), ("templates", "🧾 Shablonlar"),
     ("audit", "🕘 Audit"), ("submissions", "👀 Natijalar"), ("begin_task", "▶️ Boshladim"),
+    ("open_applications", "📂 Arizalar bo‘limini ochish"), ("view_application", "📝 Arizani ko‘rish"),
     ("submit_result", "📤 Natija topshirish"), ("approve_result", "✅ Tasdiqlash"),
     ("rework", "🔁 Qayta ishlash"), ("save_template", "🧾 Shablon sifatida saqlash"),
     ("back", "⬅️ Orqaga"), ("previous", "⬅️"), ("next", "➡️"),
@@ -964,13 +965,19 @@ async def app_send(call: CallbackQuery, state: FSMContext, bot: Bot):
        data["about"], call.from_user.id))
     await audit(call.from_user.id,"application_submitted","user",call.from_user.id)
     staff = await db_all("SELECT tg_id FROM users WHERE role IN ('superadmin','admin','manager')")
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Rad etish", callback_data=f"review:reject:{call.from_user.id}"),
-                                                InlineKeyboardButton(text="✅ Qabul qilish", callback_data=f"review:accept:{call.from_user.id}")]])
+    pending_count=(await db_one("SELECT COUNT(*) c FROM users WHERE status='pending'"))["c"]
+    direct_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Rad etish", callback_data=f"review:reject:{call.from_user.id}"),
+                                                       InlineKeyboardButton(text="✅ Qabul qilish", callback_data=f"review:accept:{call.from_user.id}")]])
+    compact_kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Arizani ko‘rish",callback_data=f"pendingview:{call.from_user.id}:0")],
+                                                     [InlineKeyboardButton(text="📂 Arizalar bo‘limini ochish",callback_data="pending:0")]])
     delivered = 0
     for member in staff:
         with suppress(TelegramForbiddenError, TelegramBadRequest):
-            await bot.send_message(member["tg_id"], app_text(data, call.from_user), reply_markup=kb)
-            if data.get("portfolio_file_id"):
+            if pending_count < 10:
+                await bot.send_message(member["tg_id"], app_text(data, call.from_user), reply_markup=direct_kb)
+            else:
+                await bot.send_message(member["tg_id"],f"🔔 <b>Yangi ariza keldi</b>\n👤 {h(data['full_name'],150)}\n💼 {SPECIALTIES.get(data.get('specialty'),'Tanlanmagan')}\n\n⏳ Kutilayotgan arizalar: <b>{pending_count} ta</b>",reply_markup=compact_kb)
+            if pending_count < 10 and data.get("portfolio_file_id"):
                 await bot.send_document(member["tg_id"], data["portfolio_file_id"],
                                         caption=f"📎 {h(data.get('portfolio_file_name'), 200)}")
             delivered += 1
