@@ -483,6 +483,15 @@ def app_text(data, user=None):
             f"💼 <b>Portfolio:</b>\n{h(portfolio, 1200)}\n\n🗒 <b>O‘zi haqida:</b>\n{h(data.get('about'), 2100)}{suffix}")
 
 
+def portfolio_display(user):
+    data=dict(user)
+    if data.get("portfolio_file_id"):
+        name=data.get("portfolio_file_name") or "Portfolio fayli"
+        kind="PDF" if str(name).lower().endswith(".pdf") else "DOCX"
+        return f"📎 <b>{h(name,300)}</b> ({kind} fayl)"
+    return h(data.get("portfolio") or "—",1200)
+
+
 @router.message(CommandStart())
 async def start(message: Message):
     await ensure_user(message.from_user)
@@ -1108,12 +1117,13 @@ async def user_detail(call: CallbackQuery):
         b.button(text="User qilish" if u["role"] == "manager" else "Manager qilish", callback_data=f"role:{u['tg_id']}:{raw_page}")
         b.button(text="✅ Faollashtirish" if u["status"] == "blocked" else "⛔ Bloklash", callback_data=f"block:{u['tg_id']}:{raw_page}")
     if u["portfolio_file_id"]:
-        b.button(text="📎 Portfolio faylini ochish", callback_data=f"portfolio:{u['tg_id']}")
+        file_kind="PDF" if str(u["portfolio_file_name"] or "").lower().endswith(".pdf") else "DOCX"
+        b.button(text=f"📄 {file_kind} portfolioni ko‘rish", callback_data=f"portfolio:{u['tg_id']}")
     b.button(text="📋 Vazifalar tarixi",callback_data=f"userhistory:{u['tg_id']}:{raw_page}")
     b.button(text="⬅️ Ro‘yxat", callback_data=f"users:{raw_page}"); b.adjust(1)
     text = (f"<b>{h(u['full_name'], 200)}</b>\n🎂 Yosh: {h(u['age'] or '—', 20)}\nID: <code>{u['tg_id']}</code>\nUsername: @{h(u['username'] or '-', 100)}\n"
             f"Telefon: {h(u['phone'] or '-', 100)}\nVakolat: {ROLE_LABELS[u['role']]}\nYo‘nalish: {SPECIALTIES.get(u['specialty'], 'Tanlanmagan')}\nHolat: {STATUS_LABELS[u['status']]}\n\n"
-            f"<b>Portfolio:</b>\n{h(u['portfolio'] or '-', 1200)}\n\n<b>O‘zi haqida:</b>\n{h(u['about'] or '-', 2100)}")
+            f"<b>Portfolio:</b>\n{portfolio_display(u)}\n\n<b>O‘zi haqida:</b>\n{h(u['about'] or '-', 2100)}")
     await call.message.edit_text(text, reply_markup=b.as_markup()); await call.answer()
 
 
@@ -1132,11 +1142,15 @@ async def user_task_history(call:CallbackQuery):
 async def send_portfolio_file(call: CallbackQuery, bot: Bot):
     if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
     uid = int(call.data.split(":", 1)[1])
-    user = await db_one("SELECT full_name,portfolio_file_id,portfolio_file_name FROM users WHERE tg_id=?", (uid,))
+    user = await db_one("SELECT * FROM users WHERE tg_id=?", (uid,))
     if not user or not user["portfolio_file_id"]: return await call.answer("Portfolio fayli topilmadi", show_alert=True)
+    caption=(f"<b>👤 USER MA’LUMOTNOMASI</b>\n\n<b>{h(user['full_name'],150)}</b>\n"
+             f"🎂 Yosh: {h(user['age'] or '—',20)}\n💼 Yo‘nalish: {SPECIALTIES.get(user['specialty'],'Tanlanmagan')}\n"
+             f"☎️ Telefon: {h(user['phone'] or '—',80)}\n📎 Portfolio: {h(user['portfolio_file_name'] or 'Portfolio fayli',180)}\n\n"
+             f"🗒 <b>O‘zi haqida:</b>\n{h(user['about'] or '—',300)}")
     await bot.send_document(call.message.chat.id, user["portfolio_file_id"],
-                            caption=f"📎 <b>{h(user['full_name'], 150)}</b> — {h(user['portfolio_file_name'], 200)}")
-    await call.answer("Portfolio yuborildi")
+                            caption=caption)
+    await call.answer("Portfolio ma’lumotnoma bilan yuborildi")
 
 
 @router.callback_query(F.data.startswith("role:"))
