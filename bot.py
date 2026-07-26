@@ -86,6 +86,11 @@ class DesignForm(StatesGroup):
     preview = State()
 
 
+class MessageEmojiForm(StatesGroup):
+    value = State()
+    preview = State()
+
+
 class TaskResult(StatesGroup):
     content = State()
 
@@ -108,7 +113,19 @@ STATUS_LABELS = {"draft": "To‘ldirilmagan", "pending": "Kutilmoqda", "accepted
 TASK_STATUS_LABELS = {"assigned": "⏳ Boshlanmagan", "in_progress": "🔄 Bajarilmoqda", "submitted": "👀 Tekshiruvda", "rework": "🔁 Qayta ishlash", "approved": "✅ Tasdiqlangan", "completed": "✅ Tugallangan"}
 ROLE_LABELS = {"user": "User", "manager": "Manager", "admin": "Admin", "superadmin": "Superadmin"}
 SPECIALTIES = {"backend": "Backend", "frontend": "Frontend", "fullstack": "Full stack", "vibecoder": "Vibecoder"}
-DESIGN = {"button_style": "primary", "premium_emoji_id": "", "button_designs": {}}
+DESIGN = {"button_style": "primary", "premium_emoji_id": "", "button_designs": {}, "message_emojis": {}}
+
+MESSAGE_EMOJI_CATALOG = [
+    ("application", "Ariza", "📝"), ("user", "Foydalanuvchi", "👤"),
+    ("age", "Yosh", "🎂"), ("specialty", "Yo‘nalish", "💼"),
+    ("username", "Username", "🔗"), ("phone", "Telefon", "☎️"),
+    ("portfolio", "Portfolio", "📎"), ("about", "O‘zi haqida", "🗒"),
+    ("accepted", "Qabul qilindi", "✅"), ("rejected", "Rad etildi", "❌"),
+    ("task", "Topshiriq", "📌"), ("reminder", "Eslatma", "🔔"),
+    ("deadline", "Muddat", "⏰"), ("warning", "Ogohlantirish", "⚠️"),
+    ("group", "Guruh", "👥"), ("completed", "Tugallandi", "☑️"),
+]
+MESSAGE_EMOJI_DEFAULTS = {key: fallback for key, _label, fallback in MESSAGE_EMOJI_CATALOG}
 
 BUTTON_CATALOG = [
     ("application", "📝 Ariza to‘ldirish"), ("admin_panel", "📊 Admin panel"),
@@ -116,6 +133,7 @@ BUTTON_CATALOG = [
     ("team_managers", "🧑‍💼 Managerlar"), ("team_developers", "💻 Dasturchilar"), ("new_task", "➕ Topshiriq"),
     ("tasks", "📋 Topshiriqlar"), ("groups", "📂 Guruhlar"),
     ("admins", "🛡 Adminlar"), ("button_design", "🎨 Tugma dizayni"),
+    ("message_emoji_design", "✨ Xabar emojilari"),
     ("switch_role", "🔄 Rolni almashtirish"), ("superadmin", "👑 Superadmin"),
     ("admin", "🛡 Admin"), ("user", "👤 User"),
     ("backend", "⚙️ Backend"), ("frontend", "🎨 Frontend"),
@@ -405,15 +423,25 @@ async def load_design():
         for row in await db_all("SELECT key,value FROM settings"):
             if row["key"] == "button_designs":
                 DESIGN["button_designs"] = json.loads(row["value"] or "{}")
+            elif row["key"] == "message_emojis":
+                DESIGN["message_emojis"] = json.loads(row["value"] or "{}")
             elif row["key"] in DESIGN:
                 DESIGN[row["key"]] = row["value"]
 
 
 async def save_setting(key, value):
-    stored_value = json.dumps(value, ensure_ascii=False) if key == "button_designs" else value
+    stored_value = json.dumps(value, ensure_ascii=False) if key in {"button_designs", "message_emojis"} else value
     await db_execute("""INSERT INTO settings(key,value) VALUES(?,?)
       ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (key, stored_value))
     DESIGN[key] = value
+
+
+def message_emoji(key: str) -> str:
+    fallback = MESSAGE_EMOJI_DEFAULTS.get(key, "✨")
+    config = DESIGN["message_emojis"].get(key, {})
+    text = h(config.get("text") or fallback, 20)
+    custom_id = config.get("custom_id")
+    return f'<tg-emoji emoji-id="{h(custom_id, 40)}">{text}</tg-emoji>' if custom_id else text
 
 
 async def save_button_design(key, style, emoji_id):
@@ -438,6 +466,7 @@ def main_kb(staff=False, superadmin=False, show_application=True, accepted_user=
                  [kb_button("📂 Guruhlar")]]
     if superadmin:
         rows += [[kb_button("🛡 Adminlar"), kb_button("🎨 Tugma dizayni")],
+                 [kb_button("✨ Xabar emojilari")],
                  [kb_button("🔄 Rolni almashtirish")]]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True) if rows else ReplyKeyboardRemove()
 
@@ -458,6 +487,7 @@ def main_inline_kb(staff=False, superadmin=False, show_application=True, accepte
     if superadmin:
         rows += [[InlineKeyboardButton(text="🛡 Adminlar", callback_data="menu:admins"),
                   InlineKeyboardButton(text="🎨 Tugma dizayni", callback_data="menu:design")],
+                 [InlineKeyboardButton(text="✨ Xabar emojilari", callback_data="menu:message_emojis")],
                  [InlineKeyboardButton(text="🔄 Rolni almashtirish", callback_data="menu:switch_role")]]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -488,9 +518,12 @@ def app_text(data, user=None):
     suffix = "\n\n<i>Uzun matn admin paneldagi user kartasida saqlandi.</i>" if len(str(data.get("portfolio", ""))) > 1200 or len(str(data.get("about", ""))) > 2100 else ""
     portfolio = data.get("portfolio") or "—"
     if data.get("portfolio_file_id"):
-        portfolio = f"📎 {data.get('portfolio_file_name') or 'Portfolio fayli'} (PDF/DOCX)"
-    return (f"<b>Ariza</b>\n\n👤 {h(full_name, 200)}\n🎂 {h(data.get('age') or '—', 20)} yosh\n💼 {h(specialty, 100)}\n🔗 @{h(username, 100)}\n☎️ {h(data.get('phone'), 100)}\n"
-            f"💼 <b>Portfolio:</b>\n{h(portfolio, 1200)}\n\n🗒 <b>O‘zi haqida:</b>\n{h(data.get('about'), 2100)}{suffix}")
+        portfolio = f"{data.get('portfolio_file_name') or 'Portfolio fayli'} (PDF/DOCX)"
+    return (f"<b>{message_emoji('application')} Ariza</b>\n\n{message_emoji('user')} {h(full_name, 200)}\n"
+            f"{message_emoji('age')} {h(data.get('age') or '—', 20)} yosh\n{message_emoji('specialty')} {h(specialty, 100)}\n"
+            f"{message_emoji('username')} @{h(username, 100)}\n{message_emoji('phone')} {h(data.get('phone'), 100)}\n"
+            f"{message_emoji('portfolio')} <b>Portfolio:</b>\n{h(portfolio, 1200)}\n\n"
+            f"{message_emoji('about')} <b>O‘zi haqida:</b>\n{h(data.get('about'), 2100)}{suffix}")
 
 
 def portfolio_display(user):
@@ -807,6 +840,101 @@ async def reset_selected_design(call: CallbackQuery, state: FSMContext):
     await show_design_catalog(call.message, edit=True)
 
 
+def message_emoji_catalog_keyboard():
+    buttons = []
+    for key, label, fallback in MESSAGE_EMOJI_CATALOG:
+        configured = DESIGN["message_emojis"].get(key, {})
+        marker = "✨" if configured.get("custom_id") else (configured.get("text") or fallback)
+        buttons.append(AiogramInlineKeyboardButton(text=f"{marker} {label}", callback_data=f"msgemoji:choose:{key}"))
+    rows = [buttons[index:index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([AiogramInlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="nav:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def show_message_emoji_catalog(target, edit=False):
+    text = ("<b>✨ Xabarlardagi emojilar</b>\n\n"
+            "O‘zgartirmoqchi bo‘lgan xabar qismini tanlang. Oddiy emoji yoki bitta Telegram Premium emoji yuborish mumkin.")
+    kb = message_emoji_catalog_keyboard()
+    if edit: await target.edit_text(text, reply_markup=kb)
+    else: await target.answer(text, reply_markup=kb)
+
+
+@router.message(F.text.in_(menu_texts("✨ Xabar emojilari")))
+async def message_emoji_panel(message: Message):
+    if not await require_superadmin(message.from_user.id): return await message.answer("Superadmin rejimini tanlang.")
+    await show_message_emoji_catalog(message)
+
+
+@router.callback_query(F.data == "msgemoji:list")
+async def message_emoji_list(call: CallbackQuery, state: FSMContext):
+    if not await require_superadmin(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    await state.clear(); await show_message_emoji_catalog(call.message, edit=True); await call.answer()
+
+
+@router.callback_query(F.data.startswith("msgemoji:choose:"))
+async def message_emoji_choose(call: CallbackQuery, state: FSMContext):
+    if not await require_superadmin(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    key = call.data.rsplit(":", 1)[1]
+    item = next((item for item in MESSAGE_EMOJI_CATALOG if item[0] == key), None)
+    if not item: return await call.answer("Emoji turi topilmadi", show_alert=True)
+    await state.set_state(MessageEmojiForm.value)
+    await state.update_data(message_emoji_key=key)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [AiogramInlineKeyboardButton(text="♻️ Standartga qaytarish", callback_data=f"msgemoji:reset:{key}", style="danger")],
+        [AiogramInlineKeyboardButton(text="⬅️ Ro‘yxat", callback_data="msgemoji:list")],
+    ])
+    await call.message.edit_text(f"<b>{h(item[1])}</b> uchun yangi oddiy emoji yoki bitta Premium emoji yuboring:", reply_markup=kb)
+    await call.answer()
+
+
+@router.message(MessageEmojiForm.value)
+async def message_emoji_receive(message: Message, state: FSMContext):
+    if not await require_superadmin(message.from_user.id): await state.clear(); return
+    data = await state.get_data(); key = data.get("message_emoji_key")
+    if key not in MESSAGE_EMOJI_DEFAULTS: await state.clear(); return await message.answer("Sozlash sessiyasi tugagan.")
+    entities = tuple(message.entities or ()) + tuple(message.caption_entities or ())
+    custom_ids = [entity.custom_emoji_id for entity in entities
+                  if entity.type == MessageEntityType.CUSTOM_EMOJI and entity.custom_emoji_id]
+    raw_text = (message.text or message.caption or "").strip()
+    if custom_ids:
+        config = {"text": raw_text or MESSAGE_EMOJI_DEFAULTS[key], "custom_id": custom_ids[0]}
+    else:
+        if not raw_text or len(raw_text) > 16:
+            return await message.answer("Faqat bitta emoji yuboring (16 belgidan oshmasin).")
+        config = {"text": raw_text, "custom_id": None}
+    await state.update_data(message_emoji_config=config)
+    await state.set_state(MessageEmojiForm.preview)
+    preview = (f'<tg-emoji emoji-id="{h(config["custom_id"],40)}">{h(config["text"],20)}</tg-emoji>'
+               if config.get("custom_id") else h(config["text"], 20))
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [AiogramInlineKeyboardButton(text="💾 Saqlash", callback_data="msgemoji:save", style="success")],
+        [AiogramInlineKeyboardButton(text="⬅️ Qayta tanlash", callback_data=f"msgemoji:choose:{key}")],
+    ])
+    try: await message.answer(f"<b>Preview:</b>\n\n{preview} Namuna xabar", reply_markup=kb)
+    except TelegramBadRequest:
+        await state.set_state(MessageEmojiForm.value)
+        await message.answer("Telegram bu emojini qabul qilmadi. Boshqasini yuboring.")
+
+
+@router.callback_query(MessageEmojiForm.preview, F.data == "msgemoji:save")
+async def message_emoji_save(call: CallbackQuery, state: FSMContext):
+    if not await require_superadmin(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    data = await state.get_data(); key = data.get("message_emoji_key"); config = data.get("message_emoji_config")
+    if key not in MESSAGE_EMOJI_DEFAULTS or not config: return await call.answer("Sozlash sessiyasi tugagan", show_alert=True)
+    settings = dict(DESIGN["message_emojis"]); settings[key] = config
+    await save_setting("message_emojis", settings); await state.clear()
+    await call.answer("Emoji saqlandi ✅", show_alert=True); await show_message_emoji_catalog(call.message, edit=True)
+
+
+@router.callback_query(F.data.startswith("msgemoji:reset:"))
+async def message_emoji_reset(call: CallbackQuery, state: FSMContext):
+    if not await require_superadmin(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    key = call.data.rsplit(":", 1)[1]
+    settings = dict(DESIGN["message_emojis"]); settings.pop(key, None)
+    await save_setting("message_emojis", settings); await state.clear()
+    await call.answer("Standart emoji qaytarildi ✅", show_alert=True); await show_message_emoji_catalog(call.message, edit=True)
+
+
 @router.message(Command("cancel"))
 @router.message(F.text.in_(menu_texts("❌ Bekor qilish")))
 async def cancel(message: Message, state: FSMContext):
@@ -1031,7 +1159,8 @@ async def review(call: CallbackQuery, bot: Bot):
     status = "accepted" if action == "accept" else "rejected"
     rejected_at = datetime.now(timezone.utc).isoformat(timespec="seconds") if status == "rejected" else None
     await db_execute("UPDATE users SET status=?,rejected_at=? WHERE tg_id=?", (status, rejected_at, uid));await audit(call.from_user.id,f"application_{status}","user",uid)
-    label = "✅ Qabul qilindi" if status == "accepted" else "❌ Rad etildi"
+    plain_label = "✅ Qabul qilindi" if status == "accepted" else "❌ Rad etildi"
+    label = f"{message_emoji('accepted')} Qabul qilindi" if status == "accepted" else f"{message_emoji('rejected')} Rad etildi"
     reviewer = call.from_user.full_name or (f"@{call.from_user.username}" if call.from_user.username else str(call.from_user.id))
     reviewed_at = datetime.now(timezone(timedelta(hours=5))).strftime("%d.%m.%Y %H:%M")
     review_status = (f"\n\n────────────\n<b>{label}</b>\n"
@@ -1055,7 +1184,7 @@ async def review(call: CallbackQuery, bot: Bot):
         if status == "accepted":
             await bot.send_message(uid, "Kerakli bo‘limni tanlang:",
                                    reply_markup=main_inline_kb(show_application=False, accepted_user=True))
-    await call.answer(label, show_alert=True)
+    await call.answer(plain_label, show_alert=True)
 
 
 async def users_keyboard(page=0, viewer_id=None):
@@ -1317,6 +1446,7 @@ async def inline_main_menu(call: CallbackQuery, state: FSMContext):
     if action == "search": return await start_user_search(actor_message, state)
     if action == "admins": return await admins_list(actor_message)
     if action == "design": return await design_panel(actor_message)
+    if action == "message_emojis": return await message_emoji_panel(actor_message)
     if action == "switch_role": return await change_mode(actor_message)
 
 
@@ -1654,7 +1784,8 @@ async def pick_group(call: CallbackQuery, state: FSMContext):
     users = await db_all(f"SELECT tg_id,username,full_name FROM users WHERE tg_id IN ({placeholders})", data["selected"])
     mentions = " ".join(user_mention(u, 60) for u in users)
     mentions = mentions[:900]
-    text = f"<b>📌 {h(data['name'], 200)}</b>\n\n{h(data['description'], 2500)}\n\n⏰ <b>Vaqti:</b> {h(data['deadline'], 200)}\n👥 {mentions}"
+    text = (f"<b>{message_emoji('task')} {h(data['name'], 200)}</b>\n\n{h(data['description'], 2500)}\n\n"
+            f"{message_emoji('deadline')} <b>Vaqti:</b> {h(data['deadline'], 200)}\n{message_emoji('group')} {mentions}")
     await state.update_data(task_text=text); await state.set_state(TaskForm.confirm)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="task:cancel"), InlineKeyboardButton(text="🚀 Yuborish", callback_data="task:send")]])
     await call.message.edit_text(text, reply_markup=kb); await call.answer()
@@ -1916,18 +2047,19 @@ async def remind_task_users(call: CallbackQuery, bot: Bot):
         mention_parts.append(mention)
         mention_length += len(mention) + 1
     mentions = " ".join(mention_parts)
-    group_text = (f"🔔 <b>TOPSHIRIQ BO‘YICHA ESLATMA</b>\n\n"
-                  f"📌 {h(task['name'], 200)}\n⏰ Muddat: {h(task['deadline'], 200)}\n\n"
-                  f"{mentions}\n\n⚠️ Ushbu topshiriqni belgilangan muddatda bajarishingiz talab qilinadi.")
+    group_text = (f"{message_emoji('reminder')} <b>TOPSHIRIQ BO‘YICHA ESLATMA</b>\n\n"
+                  f"{message_emoji('task')} {h(task['name'], 200)}\n{message_emoji('deadline')} Muddat: {h(task['deadline'], 200)}\n\n"
+                  f"{mentions}\n\n{message_emoji('warning')} Ushbu topshiriqni belgilangan muddatda bajarishingiz talab qilinadi.")
     failures = []
     try:
         await bot.send_message(task["group_id"], group_text)
     except (TelegramForbiddenError, TelegramBadRequest):
         failures.append(task["group_id"])
 
-    private_text = (f"🔔 <b>Topshiriq bo‘yicha eslatma</b>\n\n📌 {h(task['name'], 200)}\n"
-                    f"{h(task['description'], 2200)}\n\n⏰ <b>Muddat:</b> {h(task['deadline'], 200)}\n\n"
-                    f"⚠️ Topshiriqni belgilangan muddatda bajarishingiz talab qilinadi.")
+    private_text = (f"{message_emoji('reminder')} <b>Topshiriq bo‘yicha eslatma</b>\n\n"
+                    f"{message_emoji('task')} {h(task['name'], 200)}\n{h(task['description'], 2200)}\n\n"
+                    f"{message_emoji('deadline')} <b>Muddat:</b> {h(task['deadline'], 200)}\n\n"
+                    f"{message_emoji('warning')} Topshiriqni belgilangan muddatda bajarishingiz talab qilinadi.")
     done_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="▶️ Boshladim",callback_data=f"begin:{task_id}"),InlineKeyboardButton(text="📤 Natija topshirish", callback_data=f"done:{task_id}")]])
     delivered = 0
     for user in users:
@@ -1978,7 +2110,10 @@ async def automatic_reminders(bot:Bot):
                 elif hours<=3 and not row['reminded_3']:flag='reminded_3';label="3 soatdan kam"
                 elif hours<=24 and not row['reminded_24']:flag='reminded_24';label="24 soatdan kam"
                 if not flag:continue
-                text=f"🔔 <b>Avtomatik eslatma</b>\n📌 {h(row['name'],180)}\n⏰ {h(row['deadline'],100)}\n⚠️ Qolgan vaqt: {label}"
+                text=(f"{message_emoji('reminder')} <b>Avtomatik eslatma</b>\n"
+                      f"{message_emoji('task')} {h(row['name'],180)}\n"
+                      f"{message_emoji('deadline')} {h(row['deadline'],100)}\n"
+                      f"{message_emoji('warning')} Qolgan vaqt: {label}")
                 with suppress(TelegramBadRequest,TelegramForbiddenError):await bot.send_message(row['user_id'],text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📤 Natija topshirish",callback_data=f"done:{row['id']}")]]))
                 if row['group_id']:
                     with suppress(TelegramBadRequest,TelegramForbiddenError):await bot.send_message(row['group_id'],text+f"\n👤 {user_mention(row,80)}")
