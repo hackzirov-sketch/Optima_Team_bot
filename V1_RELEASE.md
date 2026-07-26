@@ -21,7 +21,7 @@ Holat: **V1 feature freeze — yakunlangan va production uchun tayyor**
 - Xabarlardagi oddiy/Premium emojilar va asosiy xabar shablonlarini botsiz kod o‘zgartirmasdan sozlash.
 - `/status` orqali Supabase, uptime, user va pending ariza holatini ko‘rish.
 - Kutilmagan xatolarni superadminlarga Telegram orqali avtomatik bildirish.
-- Audit jurnali, qidiruv, shablonlar, portfolio ma’lumotnomasi va guruh boshqaruvi.
+- Amallar hisoboti, qidiruv, shablonlar, portfolio ma’lumotnomasi va guruh boshqaruvi.
 
 ## Ma’lumotlar va backup
 

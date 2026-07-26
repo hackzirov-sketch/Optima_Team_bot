@@ -176,7 +176,7 @@ BUTTON_CATALOG = [
     ("done", "☑️ Bajardim"), ("remind", "🔔 Eslatma yuborish"),
     ("my_tasks", "📥 Vazifalar"), ("my_completed_tasks", "✅ Tugallangan vazifalarim"),
     ("profile", "👤 Profilim"), ("search", "🔎 Qidiruv"), ("templates", "🧾 Shablonlar"),
-    ("audit", "🕘 Audit"), ("submissions", "👀 Natijalar"), ("begin_task", "▶️ Boshladim"),
+    ("audit", "📑 Hisobot"), ("submissions", "👀 Natijalar"), ("begin_task", "▶️ Boshladim"),
     ("open_applications", "📂 Arizalar bo‘limini ochish"), ("view_application", "📝 Arizani ko‘rish"),
     ("submit_result", "📤 Natija topshirish"), ("approve_result", "✅ Tasdiqlash"),
     ("rework", "🔁 Qayta ishlash"), ("save_template", "🧾 Shablon sifatida saqlash"),
@@ -1381,7 +1381,7 @@ async def panel(message: Message):
     b.button(text="📂 Guruhlar", callback_data="groups:show")
     b.button(text="🔎 Qidiruv", callback_data="menu:search")
     b.button(text="🧾 Shablonlar", callback_data="menu:templates")
-    b.button(text="🕘 Audit", callback_data="menu:audit")
+    b.button(text="📑 Hisobot", callback_data="menu:audit")
     b.button(text="👀 Natijalar",callback_data="submissions:show")
     b.button(text="📈 Kengaytirilgan statistika",callback_data="stats:v1")
     b.button(text="🏠 Bosh sahifa", callback_data="nav:home", design_key="home")
@@ -1391,7 +1391,15 @@ async def panel(message: Message):
 
 @router.callback_query(F.data == "stats:v1")
 async def v1_statistics(call: CallbackQuery):
-    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    if not await is_actual_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    await call.answer("Statistika hisoblanmoqda…")
+    people = await db_one("""SELECT COUNT(*) users,
+      COUNT(*) FILTER (WHERE status='pending') pending,
+      COUNT(*) FILTER (WHERE status='accepted') accepted,
+      COUNT(*) FILTER (WHERE role='admin') admins,
+      COUNT(*) FILTER (WHERE role='manager') managers,
+      COUNT(*) FILTER (WHERE role='user' AND status='accepted') developers FROM users""")
+    task_count = (await db_one("SELECT COUNT(*) c FROM tasks"))["c"]
     summary = await db_one("""SELECT COUNT(*) assignments,
       COUNT(*) FILTER (WHERE status IN ('approved','completed')) completed,
       COUNT(*) FILTER (WHERE deadline_at IS NOT NULL AND completed_at > deadline_at) late,
@@ -1407,10 +1415,13 @@ async def v1_statistics(call: CallbackQuery):
       JOIN tasks t ON t.id=tu.task_id GROUP BY u.tg_id,u.full_name ORDER BY done DESC LIMIT 10""") if pg_pool else []
     spec_text = "\n".join(f"• {h(SPECIALTIES.get(x['specialty'],x['specialty']),50)}: {x['done']} ta · ⭐ {x['rating'] or '—'}" for x in specialties) or "Hozircha ma’lumot yo‘q"
     leader_text = "\n".join(f"{i+1}. {h(x['full_name'],60)} — ✅ {x['done']} · ⏱ {x['late']} · ⭐ {x['rating'] or '—'}" for i,x in enumerate(leaders)) or "Hozircha ma’lumot yo‘q"
-    text=(f"<b>📈 V1 statistika</b>\n\n📋 Biriktirishlar: {summary['assignments'] or 0}\n✅ Bajarilgan: {summary['completed'] or 0}\n"
+    text=(f"<b>📈 Kengaytirilgan statistika</b>\n\n<b>Jamoa va arizalar</b>\n👥 Jami profillar: {people['users'] or 0}\n"
+          f"✅ Qabul qilingan: {people['accepted'] or 0}\n⏳ Kutilayotgan arizalar: {people['pending'] or 0}\n"
+          f"🛡 Adminlar: {people['admins'] or 0}\n🧑‍💼 Managerlar: {people['managers'] or 0}\n💻 Dasturchilar: {people['developers'] or 0}\n\n"
+          f"<b>Topshiriqlar</b>\n📌 Jami topshiriqlar: {task_count or 0}\n📋 Biriktirishlar: {summary['assignments'] or 0}\n✅ Bajarilgan: {summary['completed'] or 0}\n"
           f"⏱ Kechikkan: {summary['late'] or 0}\n🕒 O‘rtacha vaqt: {summary['avg_hours'] or '—'} soat\n⭐ O‘rtacha baho: {summary['avg_rating'] or '—'}\n\n"
           f"<b>Yo‘nalishlar</b>\n{spec_text}\n\n<b>Userlar</b>\n{leader_text}")
-    await call.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Panel",callback_data="menu:panel")]]));await call.answer()
+    await call.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Panel",callback_data="menu:panel")]]))
 
 
 async def pending_keyboard(page=0):
@@ -1869,7 +1880,7 @@ async def audit_list(message:Message):
     if not await is_staff(message.from_user.id):return
     rows=await db_all("SELECT a.*,u.full_name actor FROM audit_logs a LEFT JOIN users u ON u.tg_id=a.actor_id ORDER BY a.id DESC LIMIT 30")
     lines=[f"• {h(x['actor'] or x['actor_id'] or 'Tizim',60)} — {h(x['action'],80)} — {h(x['target_id'] or '',40)}" for x in rows]
-    await message.answer("<b>🕘 So‘nggi audit amallari</b>\n\n"+("\n".join(lines) or "Hozircha yozuv yo‘q."),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Panel",callback_data="menu:panel")]]))
+    await message.answer("<b>📑 So‘nggi amallar hisoboti</b>\n\n"+("\n".join(lines) or "Hozircha yozuv yo‘q."),reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Panel",callback_data="menu:panel")]]))
 
 
 @router.message(F.text.in_(menu_texts("➕ Topshiriq")))
