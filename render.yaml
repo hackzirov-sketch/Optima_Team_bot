@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: xodimlar-telegram-bot
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    numInstances: 1
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: SUPERADMIN_IDS
+        value: "7521446360,6907502858"
+      - key: ADMIN_IDS
+        value: "5956277139"
+      - key: DEFAULT_GROUP_ID
+        value: "-5266406926"
+      - key: DATABASE_URL
+        sync: false
+      - key: REQUIRE_DATABASE
+        value: "true"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PORT
+        value: "10000"

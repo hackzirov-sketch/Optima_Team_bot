@@ -1,0 +1,1029 @@
+import asyncio
+import html
+import logging
+import os
+from contextlib import suppress
+from datetime import datetime
+
+import aiosqlite
+from aiohttp import web
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ChatType, ParseMode
+from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    BotCommand, CallbackQuery, InlineKeyboardButton as AiogramInlineKeyboardButton, InlineKeyboardMarkup,
+    KeyboardButton as AiogramKeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder as AiogramInlineKeyboardBuilder
+from dotenv import load_dotenv
+
+load_dotenv()
+TOKEN = os.getenv("BOT_TOKEN", "")
+DB_PATH = os.getenv("DATABASE_PATH", "bot.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+SUPERADMINS = {int(x) for x in os.getenv("SUPERADMIN_IDS", "").split(",") if x.strip().isdigit()}
+BOOTSTRAP_ADMINS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+DEFAULT_GROUP_ID = int(os.getenv("DEFAULT_GROUP_ID", "0"))
+pg_pool = AsyncConnectionPool(
+    conninfo=DATABASE_URL,
+    kwargs={"row_factory": dict_row, "options": "-c search_path=bot_app"},
+    min_size=1,
+    max_size=5,
+    open=False,
+) if DATABASE_URL else None
+APP_READY = False
+
+
+def create_health_app():
+    async def health(_request):
+        return web.json_response({"status": "ok" if APP_READY else "starting"}, status=200 if APP_READY else 503)
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    return app
+
+router = Router()
+
+
+class Application(StatesGroup):
+    specialty = State()
+    phone = State()
+    portfolio = State()
+    about = State()
+    confirm = State()
+
+
+class TaskForm(StatesGroup):
+    name = State()
+    description = State()
+    deadline = State()
+    users = State()
+    group = State()
+    confirm = State()
+
+
+class AdminManage(StatesGroup):
+    add_id = State()
+    remove_id = State()
+
+
+class DesignForm(StatesGroup):
+    emoji_id = State()
+
+
+PAGE_SIZE = 8
+STATUS_LABELS = {"draft": "To‘ldirilmagan", "pending": "Kutilmoqda", "accepted": "Qabul qilingan", "rejected": "Rad etilgan", "blocked": "Bloklangan"}
+ROLE_LABELS = {"user": "User", "manager": "Manager", "admin": "Admin", "superadmin": "Superadmin"}
+SPECIALTIES = {"backend": "Backend", "frontend": "Frontend", "fullstack": "Full stack", "vibecoder": "Vibecoder"}
+DESIGN = {"button_style": "primary", "premium_emoji_id": ""}
+
+
+def InlineKeyboardButton(**kwargs):
+    kwargs["style"] = DESIGN["button_style"]
+    kwargs.setdefault("icon_custom_emoji_id", DESIGN["premium_emoji_id"] or None)
+    return AiogramInlineKeyboardButton(**kwargs)
+
+
+def KeyboardButton(**kwargs):
+    kwargs.setdefault("style", DESIGN["button_style"])
+    kwargs.setdefault("icon_custom_emoji_id", DESIGN["premium_emoji_id"] or None)
+    return AiogramKeyboardButton(**kwargs)
+
+
+class InlineKeyboardBuilder(AiogramInlineKeyboardBuilder):
+    def button(self, **kwargs):
+        kwargs["style"] = DESIGN["button_style"]
+        kwargs.setdefault("icon_custom_emoji_id", DESIGN["premium_emoji_id"] or None)
+        return super().button(**kwargs)
+
+
+def h(value, limit=1000):
+    """Escape user text and keep the encoded result inside Telegram limits."""
+    raw = str(value or "")
+    escaped = html.escape(raw)
+    if len(escaped) <= limit:
+        return escaped
+    low, high = 0, len(raw)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if len(html.escape(raw[:mid])) <= max(0, limit - 1): low = mid
+        else: high = mid - 1
+    return html.escape(raw[:low]) + "…"
+
+
+async def db_execute(sql: str, params=()):
+    if pg_pool:
+        async with pg_pool.connection() as conn:
+            await conn.execute(sql.replace("?", "%s"), params)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(sql, params)
+        await db.commit()
+
+
+async def db_one(sql: str, params=()):
+    if pg_pool:
+        async with pg_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(sql.replace("?", "%s"), params)
+                return await cur.fetchone()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(sql, params) as cur:
+            return await cur.fetchone()
+
+
+async def db_all(sql: str, params=()):
+    if pg_pool:
+        async with pg_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(sql.replace("?", "%s"), params)
+                return await cur.fetchall()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(sql, params) as cur:
+            return await cur.fetchall()
+
+
+async def init_db():
+    if pg_pool:
+        await pg_pool.open()
+        await pg_pool.wait()
+        await db_one("SELECT 1 AS ok")
+        for admin_id in SUPERADMINS:
+            await db_execute("""INSERT INTO users(tg_id,full_name,role,status)
+              VALUES(?,?,'superadmin','accepted') ON CONFLICT(tg_id) DO UPDATE SET role='superadmin',status='accepted'""",
+              (admin_id, "Superadmin"))
+        for admin_id in BOOTSTRAP_ADMINS - SUPERADMINS:
+            await db_execute("""INSERT INTO users(tg_id,full_name,role,status)
+              VALUES(?,?,'admin','accepted') ON CONFLICT(tg_id) DO UPDATE SET role='admin',status='accepted'""",
+              (admin_id, f"Admin {admin_id}"))
+        if DEFAULT_GROUP_ID:
+            await db_execute("""INSERT INTO groups(chat_id,title,added_by) VALUES(?,? ,NULL)
+              ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title""", (DEFAULT_GROUP_ID, "Optima Team"))
+        await load_design()
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript("""
+        CREATE TABLE IF NOT EXISTS users(
+          tg_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT NOT NULL,
+          phone TEXT, portfolio TEXT, about TEXT,
+          role TEXT NOT NULL DEFAULT 'user', status TEXT NOT NULL DEFAULT 'draft',
+          active_mode TEXT NOT NULL DEFAULT 'user',
+          specialty TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS groups(
+          chat_id INTEGER PRIMARY KEY, title TEXT NOT NULL, added_by INTEGER,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS tasks(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+          description TEXT NOT NULL, deadline TEXT NOT NULL, group_id INTEGER,
+          created_by INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS task_users(
+          task_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+          status TEXT NOT NULL DEFAULT 'assigned', completed_at TEXT,
+          PRIMARY KEY(task_id,user_id)
+        );
+        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        """)
+        user_columns = {row[1] for row in await (await db.execute("PRAGMA table_info(users)")).fetchall()}
+        if "active_mode" not in user_columns:
+            await db.execute("ALTER TABLE users ADD COLUMN active_mode TEXT NOT NULL DEFAULT 'user'")
+        if "specialty" not in user_columns:
+            await db.execute("ALTER TABLE users ADD COLUMN specialty TEXT")
+        columns = {row[1] for row in await (await db.execute("PRAGMA table_info(task_users)")).fetchall()}
+        if "status" not in columns:
+            await db.execute("ALTER TABLE task_users ADD COLUMN status TEXT NOT NULL DEFAULT 'assigned'")
+        if "completed_at" not in columns:
+            await db.execute("ALTER TABLE task_users ADD COLUMN completed_at TEXT")
+        for admin_id in SUPERADMINS:
+            await db.execute("""INSERT INTO users(tg_id,full_name,role,status)
+              VALUES(?,?,'superadmin','accepted') ON CONFLICT(tg_id) DO UPDATE SET role='superadmin',status='accepted'""",
+              (admin_id, "Superadmin"))
+        for admin_id in BOOTSTRAP_ADMINS - SUPERADMINS:
+            await db.execute("""INSERT INTO users(tg_id,full_name,role,status)
+              VALUES(?,?,'admin','accepted') ON CONFLICT(tg_id) DO UPDATE SET role='admin',status='accepted'""",
+              (admin_id, f"Admin {admin_id}"))
+        if DEFAULT_GROUP_ID:
+            await db.execute("""INSERT INTO groups(chat_id,title,added_by) VALUES(?,? ,NULL)
+              ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title""", (DEFAULT_GROUP_ID, "Optima Team"))
+        await db.commit()
+    await load_design()
+
+
+async def ensure_user(tg_user):
+    await db_execute("""INSERT INTO users(tg_id,username,full_name) VALUES(?,?,?)
+      ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username,full_name=excluded.full_name""",
+      (tg_user.id, tg_user.username, tg_user.full_name))
+
+
+async def create_task(data, created_by):
+    if pg_pool:
+        async with pg_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""INSERT INTO tasks(name,description,deadline,group_id,created_by)
+                  VALUES(%s,%s,%s,%s,%s) RETURNING id""",
+                  (data["name"], data["description"], data["deadline"], data["group_id"], created_by))
+                task_id = (await cur.fetchone())["id"]
+                await cur.executemany("INSERT INTO task_users(task_id,user_id) VALUES(%s,%s)", [(task_id, u) for u in data["selected"]])
+                return task_id
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("INSERT INTO tasks(name,description,deadline,group_id,created_by) VALUES(?,?,?,?,?)",
+                               (data["name"], data["description"], data["deadline"], data["group_id"], created_by))
+        task_id = cur.lastrowid
+        await db.executemany("INSERT INTO task_users(task_id,user_id) VALUES(?,?)", [(task_id, u) for u in data["selected"]])
+        await db.commit()
+        return task_id
+
+
+async def role_of(user_id: int) -> str:
+    row = await db_one("SELECT role FROM users WHERE tg_id=?", (user_id,))
+    return row["role"] if row else "user"
+
+
+async def effective_role(user_id: int) -> str:
+    row = await db_one("SELECT role,active_mode FROM users WHERE tg_id=?", (user_id,))
+    if not row: return "user"
+    return row["active_mode"] if row["role"] == "superadmin" else row["role"]
+
+
+async def is_staff(user_id: int) -> bool:
+    return await effective_role(user_id) in {"superadmin", "admin", "manager"}
+
+
+async def load_design():
+    with suppress(Exception):
+        for row in await db_all("SELECT key,value FROM settings"):
+            if row["key"] in DESIGN: DESIGN[row["key"]] = row["value"]
+
+
+async def save_setting(key, value):
+    await db_execute("""INSERT INTO settings(key,value) VALUES(?,?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (key, value))
+    DESIGN[key] = value
+
+
+def kb_button(text, **kwargs):
+    return KeyboardButton(text=text, style=DESIGN["button_style"],
+                          icon_custom_emoji_id=DESIGN["premium_emoji_id"] or None, **kwargs)
+
+
+def main_kb(staff=False, superadmin=False):
+    rows = [[kb_button("📝 Ariza to‘ldirish")]]
+    if staff:
+        rows += [[kb_button("📊 Admin panel"), kb_button("👥 Userlar")],
+                 [kb_button("➕ Topshiriq"), kb_button("📋 Topshiriqlar")],
+                 [kb_button("📂 Guruhlar")]]
+    if superadmin:
+        rows += [[kb_button("🛡 Adminlar"), kb_button("🎨 Tugma dizayni")],
+                 [kb_button("🔄 Rolni almashtirish")]]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def app_text(data, user=None):
+    username = (user.username if user else None) or data.get("username") or "yo‘q"
+    full_name = (user.full_name if user else None) or data.get("full_name", "")
+    specialty = SPECIALTIES.get(data.get("specialty"), "Tanlanmagan")
+    suffix = "\n\n<i>Uzun matn admin paneldagi user kartasida saqlandi.</i>" if len(str(data.get("portfolio", ""))) > 1200 or len(str(data.get("about", ""))) > 2100 else ""
+    return (f"<b>Ariza</b>\n\n👤 {h(full_name, 200)}\n💼 {h(specialty, 100)}\n🔗 @{h(username, 100)}\n☎️ {h(data.get('phone'), 100)}\n"
+            f"💼 <b>Portfolio:</b>\n{h(data.get('portfolio'), 1200)}\n\n🗒 <b>O‘zi haqida:</b>\n{h(data.get('about'), 2100)}{suffix}")
+
+
+@router.message(CommandStart())
+async def start(message: Message):
+    await ensure_user(message.from_user)
+    if await role_of(message.from_user.id) == "superadmin":
+        return await show_role_picker(message)
+    await message.answer("Assalomu alaykum! Kerakli bo‘limni tanlang.", reply_markup=main_kb(await is_staff(message.from_user.id)))
+
+
+async def show_role_picker(message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👑 Superadmin", callback_data="mode:superadmin", style="primary")],
+        [InlineKeyboardButton(text="🛡 Admin", callback_data="mode:admin", style="success")],
+        [InlineKeyboardButton(text="👤 User", callback_data="mode:user")],
+    ])
+    await message.answer("<b>Qaysi rol bilan kirmoqchisiz?</b>", reply_markup=kb)
+
+
+async def send_specialty_picker(message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ Backend", callback_data="specialty:backend", style="primary"),
+         InlineKeyboardButton(text="🎨 Frontend", callback_data="specialty:frontend", style="primary")],
+        [InlineKeyboardButton(text="🧩 Full stack", callback_data="specialty:fullstack", style="success"),
+         InlineKeyboardButton(text="✨ Vibecoder", callback_data="specialty:vibecoder", style="success")],
+    ])
+    await message.answer("<b>💼 Kasbiy yo‘nalishingizni tanlang:</b>", reply_markup=kb)
+
+
+@router.callback_query(Application.specialty, F.data.startswith("specialty:"))
+async def select_specialty(call: CallbackQuery, state: FSMContext):
+    specialty = call.data.split(":")[1]
+    if specialty not in SPECIALTIES: return await call.answer("Noto‘g‘ri yo‘nalish", show_alert=True)
+    await db_execute("UPDATE users SET specialty=? WHERE tg_id=?", (specialty, call.from_user.id))
+    await state.update_data(specialty=specialty)
+    await call.message.edit_text(f"✅ Yo‘nalishingiz: <b>{SPECIALTIES[specialty]}</b>")
+    await ask_phone(call.message, state)
+    await call.answer("Saqlandi")
+
+
+async def ask_phone(message, state):
+    await state.set_state(Application.phone)
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)]],
+                             resize_keyboard=True, one_time_keyboard=True)
+    await message.answer("Telefon raqamingizni yuboring yoki matn ko‘rinishida yozing:", reply_markup=kb)
+
+
+@router.message(F.text == "🔄 Rolni almashtirish")
+async def change_mode(message: Message):
+    if await role_of(message.from_user.id) != "superadmin": return
+    await show_role_picker(message)
+
+
+@router.callback_query(F.data.startswith("mode:"))
+async def select_mode(call: CallbackQuery):
+    if await role_of(call.from_user.id) != "superadmin": return await call.answer("Ruxsat yo‘q", show_alert=True)
+    mode = call.data.split(":")[1]
+    if mode not in {"superadmin", "admin", "user"}: return await call.answer("Noto‘g‘ri rol", show_alert=True)
+    await db_execute("UPDATE users SET active_mode=? WHERE tg_id=?", (mode, call.from_user.id))
+    await call.message.edit_text(f"✅ <b>{ROLE_LABELS[mode]}</b> rejimi tanlandi.")
+    await call.message.answer("Bosh sahifa", reply_markup=main_kb(mode in {"superadmin","admin"}, mode == "superadmin"))
+    await call.answer()
+
+
+async def require_superadmin(user_id):
+    return await role_of(user_id) == "superadmin" and await effective_role(user_id) == "superadmin"
+
+
+async def admins_markup():
+    admins = await db_all("SELECT tg_id,full_name,username FROM users WHERE role='admin' ORDER BY full_name")
+    lines = ["<b>🛡 Adminlar ro‘yxati</b>"]
+    lines += [f"• {h(x['full_name'],100)} · <code>{x['tg_id']}</code> · @{h(x['username'] or '-',50)}" for x in admins]
+    if not admins: lines.append("Hozircha adminlar yo‘q.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Admin tayinlash", callback_data="admin:add", style="success")],
+        [InlineKeyboardButton(text="➖ Adminni olib tashlash", callback_data="admin:remove", style="danger")],
+    ])
+    return "\n".join(lines), kb
+
+
+@router.message(F.text == "🛡 Adminlar")
+async def admins_list(message: Message):
+    if not await require_superadmin(message.from_user.id): return await message.answer("Superadmin rejimini tanlang.")
+    text, kb = await admins_markup(); await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.in_({"admin:add", "admin:remove"}))
+async def admin_action(call: CallbackQuery, state: FSMContext):
+    if not await require_superadmin(call.from_user.id): return await call.answer("Faqat Superadmin rejimida", show_alert=True)
+    adding = call.data == "admin:add"
+    await state.set_state(AdminManage.add_id if adding else AdminManage.remove_id)
+    await call.message.answer("Admin qilinadigan Telegram ID’ni yuboring:" if adding else "Adminlikdan olinadigan Telegram ID’ni yuboring:")
+    await call.answer()
+
+
+async def set_admin_role(message: Message, state: FSMContext, adding: bool, raw_id=None):
+    if not await require_superadmin(message.from_user.id): await state.clear(); return
+    value = str(raw_id if raw_id is not None else (message.text or "")).strip()
+    if not value.isdigit(): return await message.answer("Faqat raqamlardan iborat Telegram ID yuboring.")
+    uid = int(value)
+    if uid in SUPERADMINS: return await message.answer("Superadmin rolini o‘zgartirib bo‘lmaydi.")
+    if adding:
+        await db_execute("""INSERT INTO users(tg_id,full_name,role,status) VALUES(?,?,'admin','accepted')
+          ON CONFLICT(tg_id) DO UPDATE SET role='admin',status='accepted'""", (uid, f"Admin {uid}"))
+        result = f"✅ <code>{uid}</code> admin etib tayinlandi."
+    else:
+        user = await db_one("SELECT role FROM users WHERE tg_id=?", (uid,))
+        if not user or user["role"] != "admin": return await message.answer("Bu ID adminlar ro‘yxatida yo‘q.")
+        await db_execute("UPDATE users SET role='user',active_mode='user' WHERE tg_id=?", (uid,))
+        result = f"✅ <code>{uid}</code> adminlikdan olib tashlandi."
+    await state.clear(); text, kb = await admins_markup(); await message.answer(result); await message.answer(text, reply_markup=kb)
+
+
+@router.message(AdminManage.add_id)
+async def add_admin_id(message: Message, state: FSMContext): await set_admin_role(message, state, True)
+
+
+@router.message(AdminManage.remove_id)
+async def remove_admin_id(message: Message, state: FSMContext): await set_admin_role(message, state, False)
+
+
+@router.message(Command("add_admin"))
+async def add_admin_command(message: Message, state: FSMContext):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2: return await message.answer("Format: /add_admin TELEGRAM_ID")
+    await set_admin_role(message, state, True, parts[1])
+
+
+@router.message(Command("remove_admin"))
+async def remove_admin_command(message: Message, state: FSMContext):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2: return await message.answer("Format: /remove_admin TELEGRAM_ID")
+    await set_admin_role(message, state, False, parts[1])
+
+
+@router.message(F.text == "🎨 Tugma dizayni")
+async def design_panel(message: Message):
+    if not await require_superadmin(message.from_user.id): return await message.answer("Superadmin rejimini tanlang.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔵 Ko‘k", callback_data="design:style:primary", style="primary"),
+         InlineKeyboardButton(text="🟢 Yashil", callback_data="design:style:success", style="success"),
+         InlineKeyboardButton(text="🔴 Qizil", callback_data="design:style:danger", style="danger")],
+        [InlineKeyboardButton(text="✨ Premium emoji ID", callback_data="design:emoji")],
+        [InlineKeyboardButton(text="🧹 Emojini olib tashlash", callback_data="design:emoji:clear")],
+    ])
+    emoji = DESIGN["premium_emoji_id"] or "o‘rnatilmagan"
+    await message.answer(f"<b>🎨 Tugmalar dizayni</b>\n\nRang: {DESIGN['button_style']}\nPremium emoji ID: <code>{emoji}</code>", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("design:style:"))
+async def set_button_style(call: CallbackQuery):
+    if not await require_superadmin(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    style = call.data.split(":")[2]
+    if style not in {"primary","success","danger"}: return
+    await save_setting("button_style", style); await call.answer("Rang saqlandi", show_alert=True)
+
+
+@router.callback_query(F.data == "design:emoji")
+async def ask_emoji(call: CallbackQuery, state: FSMContext):
+    if not await require_superadmin(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    await state.set_state(DesignForm.emoji_id)
+    await call.message.answer("Premium custom emoji ID’ni yuboring. ID’ni custom emoji xabaridan maxsus info bot orqali olish mumkin.")
+    await call.answer()
+
+
+@router.callback_query(F.data == "design:emoji:clear")
+async def clear_emoji(call: CallbackQuery):
+    if not await require_superadmin(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    await save_setting("premium_emoji_id", ""); await call.answer("Premium emoji olib tashlandi", show_alert=True)
+
+
+@router.message(DesignForm.emoji_id)
+async def set_emoji(message: Message, state: FSMContext):
+    if not await require_superadmin(message.from_user.id): await state.clear(); return
+    emoji_id = (message.text or "").strip()
+    if not emoji_id.isdigit(): return await message.answer("Custom emoji ID faqat raqamlardan iborat bo‘lishi kerak.")
+    try:
+        await message.answer("Premium emoji tekshiruvi", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Test tugma", callback_data="noop", style=DESIGN["button_style"], icon_custom_emoji_id=emoji_id)
+        ]]))
+    except TelegramBadRequest:
+        return await message.answer("Telegram bu emoji ID’ni qabul qilmadi. Bot egasida Premium borligini va ID to‘g‘riligini tekshiring.")
+    await save_setting("premium_emoji_id", emoji_id); await state.clear()
+    await message.answer("✅ Premium emoji saqlandi. Yangi bosh sahifa tugmalarida ishlatiladi.")
+
+
+@router.message(Command("cancel"))
+@router.message(F.text == "❌ Bekor qilish")
+async def cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Amal bekor qilindi.", reply_markup=main_kb(await is_staff(message.from_user.id)))
+
+
+@router.message(F.text == "📝 Ariza to‘ldirish")
+async def application_start(message: Message, state: FSMContext):
+    if message.chat.type != ChatType.PRIVATE:
+        return await message.answer("Ariza shaxsiy ma’lumotlarni saqlaydi. Uni botning shaxsiy chatida to‘ldiring.")
+    current = await db_one("SELECT status FROM users WHERE tg_id=?", (message.from_user.id,))
+    if current and current["status"] == "blocked":
+        return await message.answer("⛔ Profilingiz admin tomonidan vaqtincha bloklangan.")
+    await state.clear()
+    await state.update_data(username=message.from_user.username, full_name=message.from_user.full_name)
+    await state.set_state(Application.specialty)
+    await send_specialty_picker(message)
+
+
+@router.message(Application.phone, F.contact)
+async def app_phone_contact(message: Message, state: FSMContext):
+    if message.contact.user_id and message.contact.user_id != message.from_user.id:
+        return await message.answer("Iltimos, aynan o‘zingizning kontaktingizni yuboring.")
+    await state.update_data(phone=message.contact.phone_number)
+    await state.set_state(Application.portfolio)
+    await message.answer("Portfolio havolasi yoki portfolio haqidagi ma’lumotni yuboring:", reply_markup=ReplyKeyboardRemove())
+
+
+@router.message(Application.phone, F.text)
+async def app_phone_text(message: Message, state: FSMContext):
+    await state.update_data(phone=message.text)
+    await state.set_state(Application.portfolio)
+    await message.answer("Portfolio havolasi yoki portfolio haqidagi ma’lumotni yuboring:", reply_markup=ReplyKeyboardRemove())
+
+
+@router.message(Application.portfolio, F.text)
+async def app_portfolio(message: Message, state: FSMContext):
+    await state.update_data(portfolio=message.text)
+    await state.set_state(Application.about)
+    await message.answer("O‘zingiz haqingizda yozing (hajm cheklanmagan):")
+
+
+@router.message(Application.about, F.text)
+async def app_about(message: Message, state: FSMContext):
+    await state.update_data(about=message.text)
+    await state.set_state(Application.confirm)
+    data = await state.get_data()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✏️ Tahrirlash", callback_data="app:edit"),
+                                                InlineKeyboardButton(text="📨 Arizani jo‘natish", callback_data="app:send")]])
+    await message.answer(app_text(data, message.from_user), reply_markup=kb)
+
+
+@router.callback_query(Application.confirm, F.data == "app:edit")
+async def app_edit(call: CallbackQuery, state: FSMContext):
+    await state.set_state(Application.phone)
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer("Telefon raqamingizni qayta kiriting:")
+    await call.answer()
+
+
+@router.callback_query(Application.confirm, F.data == "app:send")
+async def app_send(call: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await db_execute("""UPDATE users SET username=?,full_name=?,phone=?,portfolio=?,about=?,status='pending' WHERE tg_id=?""",
+                     (call.from_user.username, call.from_user.full_name, data["phone"], data["portfolio"], data["about"], call.from_user.id))
+    staff = await db_all("SELECT tg_id FROM users WHERE role IN ('superadmin','admin','manager')")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Rad etish", callback_data=f"review:reject:{call.from_user.id}"),
+                                                InlineKeyboardButton(text="✅ Qabul qilish", callback_data=f"review:accept:{call.from_user.id}")]])
+    delivered = 0
+    for member in staff:
+        with suppress(TelegramForbiddenError, TelegramBadRequest):
+            await bot.send_message(member["tg_id"], app_text(data, call.from_user), reply_markup=kb)
+            delivered += 1
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer("✅ Arizangiz yuborildi." if delivered else "⚠️ Ariza saqlandi, ammo mas’ullarga xabar yetkazilmadi.", reply_markup=main_kb(False))
+    await state.clear(); await call.answer()
+
+
+@router.callback_query(F.data.startswith("review:"))
+async def review(call: CallbackQuery, bot: Bot):
+    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    _, action, raw_id = call.data.split(":"); uid = int(raw_id)
+    current = await db_one("SELECT status,full_name FROM users WHERE tg_id=?", (uid,))
+    if not current: return await call.answer("User topilmadi", show_alert=True)
+    if current["status"] != "pending": return await call.answer(f"Bu ariza allaqachon: {STATUS_LABELS.get(current['status'], current['status'])}", show_alert=True)
+    status = "accepted" if action == "accept" else "rejected"
+    await db_execute("UPDATE users SET status=? WHERE tg_id=?", (status, uid))
+    label = "✅ Qabul qilindi" if status == "accepted" else "❌ Rad etildi"
+    with suppress(TelegramForbiddenError): await bot.send_message(uid, f"Arizangiz holati: {label}")
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer(f"{label}: {html.escape(current['full_name'])}\nKo‘rib chiqdi: {html.escape(call.from_user.full_name)}")
+    await call.answer()
+
+
+async def users_keyboard(page=0):
+    total = (await db_one("SELECT COUNT(*) AS c FROM users"))["c"]
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE); page = max(0, min(page, pages - 1))
+    rows = await db_all("SELECT tg_id,full_name,status,role,specialty FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?", (PAGE_SIZE, page * PAGE_SIZE))
+    b = InlineKeyboardBuilder()
+    for u in rows:
+        title = f"{u['full_name']} · {SPECIALTIES.get(u['specialty'], '—')} · {STATUS_LABELS[u['status']]}"
+        b.button(text=title[:60], callback_data=f"usr:{u['tg_id']}:{page}")
+    if page: b.button(text="⬅️", callback_data=f"users:{page-1}")
+    b.button(text=f"{page+1}/{pages}", callback_data="noop")
+    if page + 1 < pages: b.button(text="➡️", callback_data=f"users:{page+1}")
+    b.adjust(*([1] * len(rows)), 3)
+    return b.as_markup(), total
+
+
+@router.message(Command("panel"))
+@router.message(F.text == "📊 Admin panel")
+async def panel(message: Message):
+    if not await is_staff(message.from_user.id): return await message.answer("Bu bo‘lim uchun ruxsat yo‘q.")
+    stats = await db_one("""SELECT COUNT(*) total,
+      COUNT(*) FILTER (WHERE status='pending') pending,
+      COUNT(*) FILTER (WHERE status='accepted') accepted,
+      COUNT(*) FILTER (WHERE role='manager') managers FROM users""")
+    tasks = (await db_one("SELECT COUNT(*) c FROM tasks"))["c"]
+    groups = (await db_one("SELECT COUNT(*) c FROM groups"))["c"]
+    completion = await db_one("SELECT COUNT(*) total, COUNT(*) FILTER (WHERE status='completed') done FROM task_users")
+    b = InlineKeyboardBuilder()
+    b.button(text=f"⏳ Arizalar ({stats['pending'] or 0})", callback_data="pending:0")
+    b.button(text="👥 Userlar", callback_data="users:0")
+    b.button(text="📋 Topshiriqlar", callback_data="tasks:0")
+    b.button(text="📂 Guruhlar", callback_data="groups:show")
+    b.adjust(2, 2)
+    await message.answer(f"<b>📊 Admin panel</b>\n\n👥 Jami: {stats['total']}\n⏳ Kutilmoqda: {stats['pending'] or 0}\n✅ Qabul qilingan: {stats['accepted'] or 0}\n🧑‍💼 Managerlar: {stats['managers'] or 0}\n📂 Guruhlar: {groups}\n📌 Topshiriqlar: {tasks}\n☑️ Bajarilish: {completion['done'] or 0}/{completion['total'] or 0}", reply_markup=b.as_markup())
+
+
+async def pending_keyboard(page=0):
+    total = (await db_one("SELECT COUNT(*) c FROM users WHERE status='pending'"))["c"]
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE); page = max(0, min(page, pages - 1))
+    rows = await db_all("SELECT tg_id,full_name,username FROM users WHERE status='pending' ORDER BY created_at LIMIT ? OFFSET ?", (PAGE_SIZE, page * PAGE_SIZE))
+    b = InlineKeyboardBuilder()
+    for u in rows:
+        b.button(text=f"📝 {u['full_name'][:48]}", callback_data=f"pendingview:{u['tg_id']}:{page}")
+    if page: b.button(text="⬅️", callback_data=f"pending:{page-1}")
+    b.button(text=f"{page+1}/{pages}", callback_data="noop")
+    if page + 1 < pages: b.button(text="➡️", callback_data=f"pending:{page+1}")
+    b.adjust(*([1] * len(rows)), 3)
+    return b.as_markup(), total
+
+
+@router.callback_query(F.data.startswith("pending:"))
+async def pending_list(call: CallbackQuery):
+    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    page = int(call.data.split(":")[1]); kb, total = await pending_keyboard(page)
+    text = f"<b>⏳ Kutilayotgan arizalar</b> — {total} ta"
+    if not total: text += "\n\nHozircha yangi ariza yo‘q."
+    await call.message.edit_text(text, reply_markup=kb); await call.answer()
+
+
+@router.callback_query(F.data.startswith("pendingview:"))
+async def pending_detail(call: CallbackQuery):
+    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    _, raw_uid, page = call.data.split(":"); uid = int(raw_uid)
+    u = await db_one("SELECT * FROM users WHERE tg_id=? AND status='pending'", (uid,))
+    if not u: return await call.answer("Ariza allaqachon ko‘rib chiqilgan", show_alert=True)
+    data = dict(u)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Rad etish", callback_data=f"review:reject:{uid}"),
+         InlineKeyboardButton(text="✅ Qabul qilish", callback_data=f"review:accept:{uid}")],
+        [InlineKeyboardButton(text="⬅️ Arizalar", callback_data=f"pending:{page}")],
+    ])
+    await call.message.edit_text(app_text(data), reply_markup=kb); await call.answer()
+
+
+@router.message(F.text == "👥 Userlar")
+async def users_list(message: Message):
+    if not await is_staff(message.from_user.id): return
+    kb, total = await users_keyboard()
+    await message.answer(f"<b>👥 Userlar</b> — jami {total}\nBatafsil ko‘rish uchun userni tanlang:", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("users:"))
+async def users_page(call: CallbackQuery):
+    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    page = int(call.data.split(":")[1]); kb, total = await users_keyboard(page)
+    await call.message.edit_text(f"<b>👥 Userlar</b> — jami {total}\nBatafsil ko‘rish uchun userni tanlang:", reply_markup=kb); await call.answer()
+
+
+@router.callback_query(F.data.startswith("usr:"))
+async def user_detail(call: CallbackQuery):
+    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    _, raw_uid, raw_page = call.data.split(":"); u = await db_one("SELECT * FROM users WHERE tg_id=?", (int(raw_uid),))
+    if not u: return await call.answer("User topilmadi", show_alert=True)
+    b = InlineKeyboardBuilder()
+    if await effective_role(call.from_user.id) in {"admin","superadmin"} and u["role"] not in {"admin","superadmin"}:
+        b.button(text="User qilish" if u["role"] == "manager" else "Manager qilish", callback_data=f"role:{u['tg_id']}:{raw_page}")
+        b.button(text="✅ Faollashtirish" if u["status"] == "blocked" else "⛔ Bloklash", callback_data=f"block:{u['tg_id']}:{raw_page}")
+    b.button(text="⬅️ Ro‘yxat", callback_data=f"users:{raw_page}"); b.adjust(1)
+    text = (f"<b>{h(u['full_name'], 200)}</b>\nID: <code>{u['tg_id']}</code>\nUsername: @{h(u['username'] or '-', 100)}\n"
+            f"Telefon: {h(u['phone'] or '-', 100)}\nVakolat: {ROLE_LABELS[u['role']]}\nYo‘nalish: {SPECIALTIES.get(u['specialty'], 'Tanlanmagan')}\nHolat: {STATUS_LABELS[u['status']]}\n\n"
+            f"<b>Portfolio:</b>\n{h(u['portfolio'] or '-', 1200)}\n\n<b>O‘zi haqida:</b>\n{h(u['about'] or '-', 2100)}")
+    await call.message.edit_text(text, reply_markup=b.as_markup()); await call.answer()
+
+
+@router.callback_query(F.data.startswith("role:"))
+async def toggle_role(call: CallbackQuery):
+    if await effective_role(call.from_user.id) not in {"admin","superadmin"}: return await call.answer("Faqat admin uchun", show_alert=True)
+    _, raw_uid, page = call.data.split(":"); uid = int(raw_uid); u = await db_one("SELECT role FROM users WHERE tg_id=?", (uid,))
+    if not u or u["role"] in {"admin","superadmin"}: return await call.answer("Rolni o‘zgartirib bo‘lmaydi", show_alert=True)
+    new_role = "user" if u["role"] == "manager" else "manager"
+    await db_execute("UPDATE users SET role=?,status='accepted' WHERE tg_id=?", (new_role, uid))
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Ro‘yxatga qaytish", callback_data=f"users:{page}")]])
+    await call.message.edit_text(f"✅ Rol o‘zgartirildi: <b>{ROLE_LABELS[new_role]}</b>", reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("block:"))
+async def toggle_block(call: CallbackQuery, bot: Bot):
+    if await effective_role(call.from_user.id) not in {"admin","superadmin"}: return await call.answer("Faqat admin uchun", show_alert=True)
+    _, raw_uid, page = call.data.split(":"); uid = int(raw_uid)
+    u = await db_one("SELECT role,status,full_name FROM users WHERE tg_id=?", (uid,))
+    if not u or u["role"] in {"admin","superadmin"}: return await call.answer("Bu profilni bloklab bo‘lmaydi", show_alert=True)
+    new_status = "accepted" if u["status"] == "blocked" else "blocked"
+    await db_execute("UPDATE users SET status=? WHERE tg_id=?", (new_status, uid))
+    notice = "✅ Profilingiz qayta faollashtirildi." if new_status == "accepted" else "⛔ Profilingiz admin tomonidan vaqtincha bloklandi."
+    with suppress(TelegramForbiddenError, TelegramBadRequest): await bot.send_message(uid, notice)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Ro‘yxatga qaytish", callback_data=f"users:{page}")]])
+    await call.message.edit_text(f"{notice}\n👤 {h(u['full_name'],200)}", reply_markup=kb); await call.answer()
+
+
+@router.callback_query(F.data == "noop")
+async def noop(call: CallbackQuery): await call.answer()
+
+
+@router.message(Command("register_group"))
+async def register_group(message: Message):
+    if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}: return await message.answer("Bu buyruqni guruhda yuboring.")
+    if not await is_staff(message.from_user.id): return await message.answer("Faqat admin yoki manager uchun.")
+    await db_execute("""INSERT INTO groups(chat_id,title,added_by) VALUES(?,?,?)
+      ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,added_by=excluded.added_by""",
+                     (message.chat.id, message.chat.title, message.from_user.id))
+    await message.answer(f"✅ Guruh ro‘yxatdan o‘tdi. ID: <code>{message.chat.id}</code>")
+
+
+@router.message(Command("add_group"))
+async def add_group_by_id(message: Message, bot: Bot):
+    if not await is_staff(message.from_user.id): return await message.answer("Bu bo‘lim uchun ruxsat yo‘q.")
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        return await message.answer("Format: <code>/add_group -1001234567890</code> yoki <code>/add_group -1001234567890 Guruh nomi</code>")
+    chat_id = int(parts[1])
+    try:
+        chat = await bot.get_chat(chat_id)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return await message.answer("Guruh topilmadi. Bot avval guruhga qo‘shilganini va ID to‘g‘riligini tekshiring.")
+    title = parts[2] if len(parts) == 3 else (chat.title or str(chat_id))
+    await db_execute("""INSERT INTO groups(chat_id,title,added_by) VALUES(?,?,?)
+      ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,added_by=excluded.added_by""", (chat_id, title, message.from_user.id))
+    await message.answer(f"✅ {html.escape(title)} ro‘yxatga qo‘shildi.")
+
+
+@router.message(F.text == "📂 Guruhlar")
+async def groups_list(message: Message):
+    if not await is_staff(message.from_user.id): return
+    text, kb = await groups_view(await effective_role(message.from_user.id) in {"admin","superadmin"})
+    await message.answer(text, reply_markup=kb)
+
+
+async def groups_view(admin=False):
+    groups = await db_all("SELECT * FROM groups ORDER BY created_at DESC")
+    text = "<b>📂 Guruhlar</b>\n\n" + ("\n".join(f"• {h(g['title'],100)} — <code>{g['chat_id']}</code>" for g in groups) or "Hozircha yo‘q. Botni guruhga qo‘shib /register_group yuboring.")
+    b = InlineKeyboardBuilder()
+    if admin:
+        for g in groups:
+            b.button(text=f"🗑 {g['title'][:45]}", callback_data=f"groupdel:{g['chat_id']}")
+    b.button(text="🔄 Yangilash", callback_data="groups:show"); b.adjust(1)
+    return text, b.as_markup()
+
+
+@router.callback_query(F.data == "groups:show")
+async def groups_callback(call: CallbackQuery):
+    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    text, kb = await groups_view(await effective_role(call.from_user.id) in {"admin","superadmin"})
+    await call.message.edit_text(text, reply_markup=kb); await call.answer()
+
+
+@router.callback_query(F.data.startswith("groupdel:"))
+async def delete_group(call: CallbackQuery):
+    if await effective_role(call.from_user.id) not in {"admin","superadmin"}: return await call.answer("Faqat admin o‘chira oladi", show_alert=True)
+    chat_id = int(call.data.split(":")[1])
+    group = await db_one("SELECT title FROM groups WHERE chat_id=?", (chat_id,))
+    if not group: return await call.answer("Guruh topilmadi", show_alert=True)
+    await db_execute("DELETE FROM groups WHERE chat_id=?", (chat_id,))
+    text, kb = await groups_view(True)
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer(f"{group['title']} ro‘yxatdan olib tashlandi", show_alert=True)
+
+
+@router.message(F.text == "➕ Topshiriq")
+async def task_start(message: Message, state: FSMContext):
+    if not await is_staff(message.from_user.id): return
+    await state.clear(); await state.set_state(TaskForm.name)
+    await message.answer("Topshiriq nomini kiriting:")
+
+
+@router.message(TaskForm.name, F.text)
+async def task_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text); await state.set_state(TaskForm.description)
+    await message.answer("Vazifa tavsifini kiriting:")
+
+
+@router.message(TaskForm.description, F.text)
+async def task_desc(message: Message, state: FSMContext):
+    await state.update_data(description=message.text); await state.set_state(TaskForm.deadline)
+    await message.answer("Bajarish vaqtini yozing (masalan: 30.07.2026 18:00):")
+
+
+async def user_picker(selected: set[int]):
+    users = await db_all("""SELECT tg_id,full_name,username,specialty FROM users WHERE status='accepted'
+      AND (role='user' OR (role='superadmin' AND active_mode='user')) ORDER BY full_name""")
+    b = InlineKeyboardBuilder()
+    for u in users:
+        mark = "✅" if u["tg_id"] in selected else "▫️"
+        b.button(text=f"{mark} {u['full_name']} · {SPECIALTIES.get(u['specialty'], '—')}", callback_data=f"pick:{u['tg_id']}")
+    b.button(text="Davom etish ➡️", callback_data="pick:done"); b.adjust(1)
+    return b.as_markup()
+
+
+@router.message(TaskForm.deadline, F.text)
+async def task_deadline(message: Message, state: FSMContext):
+    users_count = (await db_one("""SELECT COUNT(*) c FROM users WHERE status='accepted'
+      AND (role='user' OR (role='superadmin' AND active_mode='user'))"""))["c"]
+    if not users_count:
+        await state.clear(); return await message.answer("Qabul qilingan userlar yo‘q. Avval kamida bitta arizani tasdiqlang.")
+    await state.update_data(deadline=message.text, selected=[]); await state.set_state(TaskForm.users)
+    await message.answer("Bir yoki bir nechta userni tanlang:", reply_markup=await user_picker(set()))
+
+
+@router.callback_query(TaskForm.users, F.data.startswith("pick:"))
+async def pick_user(call: CallbackQuery, state: FSMContext):
+    value = call.data.split(":",1)[1]; data = await state.get_data(); selected = set(data.get("selected", []))
+    if value != "done":
+        uid = int(value); selected.symmetric_difference_update({uid}); await state.update_data(selected=list(selected))
+        await call.message.edit_reply_markup(reply_markup=await user_picker(selected)); return await call.answer()
+    if not selected: return await call.answer("Kamida bitta user tanlang", show_alert=True)
+    groups = await db_all("SELECT chat_id,title FROM groups ORDER BY title")
+    if not groups: return await call.answer("Avval guruhni /register_group orqali ro‘yxatdan o‘tkazing", show_alert=True)
+    b = InlineKeyboardBuilder()
+    for g in groups: b.button(text=g["title"], callback_data=f"group:{g['chat_id']}")
+    b.adjust(1); await state.set_state(TaskForm.group)
+    await call.message.edit_text("Topshiriq yuboriladigan guruhni tanlang:", reply_markup=b.as_markup()); await call.answer()
+
+
+@router.callback_query(TaskForm.group, F.data.startswith("group:"))
+async def pick_group(call: CallbackQuery, state: FSMContext):
+    gid = int(call.data.split(":")[1]); await state.update_data(group_id=gid); data = await state.get_data()
+    placeholders = ",".join("?" for _ in data["selected"])
+    users = await db_all(f"SELECT tg_id,username,full_name FROM users WHERE tg_id IN ({placeholders})", data["selected"])
+    mentions = " ".join(f"@{h(u['username'], 50)}" if u['username'] else f"<a href='tg://user?id={u['tg_id']}'>{h(u['full_name'], 50)}</a>" for u in users)
+    mentions = mentions[:900]
+    text = f"<b>📌 {h(data['name'], 200)}</b>\n\n{h(data['description'], 2500)}\n\n⏰ <b>Vaqti:</b> {h(data['deadline'], 200)}\n👥 {mentions}"
+    await state.update_data(task_text=text); await state.set_state(TaskForm.confirm)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Bekor qilish", callback_data="task:cancel"), InlineKeyboardButton(text="🚀 Yuborish", callback_data="task:send")]])
+    await call.message.edit_text(text, reply_markup=kb); await call.answer()
+
+
+@router.callback_query(TaskForm.confirm, F.data.startswith("task:"))
+async def task_send(call: CallbackQuery, state: FSMContext, bot: Bot):
+    if call.data == "task:cancel":
+        await state.clear(); await call.message.edit_text("Topshiriq bekor qilindi."); return await call.answer()
+    d = await state.get_data()
+    task_id = await create_task(d, call.from_user.id)
+    failures=[]
+    try:
+        await bot.send_message(d["group_id"], d["task_text"])
+    except (TelegramForbiddenError, TelegramBadRequest): failures.append(d["group_id"])
+    done_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="☑️ Bajardim", callback_data=f"done:{task_id}")]])
+    for user_id in d["selected"]:
+        try: await bot.send_message(user_id, d["task_text"], reply_markup=done_kb)
+        except (TelegramForbiddenError, TelegramBadRequest): failures.append(user_id)
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer("✅ Topshiriq yuborildi." + (f"\nYetib bormagan chatlar: {failures}" if failures else ""))
+    await state.clear(); await call.answer()
+
+
+@router.callback_query(F.data.startswith("done:"))
+async def complete_task(call: CallbackQuery, bot: Bot):
+    task_id = int(call.data.split(":")[1])
+    assignment = await db_one("""SELECT tu.status,t.name,t.group_id,t.created_by,u.full_name,u.username
+      FROM task_users tu JOIN tasks t ON t.id=tu.task_id JOIN users u ON u.tg_id=tu.user_id
+      WHERE tu.task_id=? AND tu.user_id=?""", (task_id, call.from_user.id))
+    if not assignment: return await call.answer("Bu topshiriq sizga biriktirilmagan", show_alert=True)
+    if assignment["status"] == "completed": return await call.answer("Topshiriq avval bajarilgan", show_alert=True)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    await db_execute("UPDATE task_users SET status='completed',completed_at=? WHERE task_id=? AND user_id=?", (now, task_id, call.from_user.id))
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer("✅ Topshiriq bajarildi deb belgilandi.")
+    who = f"@{assignment['username']}" if assignment["username"] else h(assignment["full_name"], 100)
+    notice = f"☑️ <b>Topshiriq bajarildi</b>\n📌 {h(assignment['name'], 200)}\n👤 {who}"
+    for chat_id in {assignment["group_id"], assignment["created_by"]}:
+        with suppress(TelegramForbiddenError, TelegramBadRequest): await bot.send_message(chat_id, notice)
+    await call.answer("Qabul qilindi")
+
+
+async def tasks_keyboard(page=0):
+    total = (await db_one("SELECT COUNT(*) c FROM tasks"))["c"]
+    pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE); page = max(0, min(page, pages - 1))
+    rows = await db_all("""SELECT t.id,t.name,COUNT(tu.user_id) total,COUNT(*) FILTER (WHERE tu.status='completed') done
+      FROM tasks t LEFT JOIN task_users tu ON tu.task_id=t.id GROUP BY t.id ORDER BY t.id DESC LIMIT ? OFFSET ?""",
+      (PAGE_SIZE, page * PAGE_SIZE))
+    b = InlineKeyboardBuilder()
+    for task in rows:
+        b.button(text=f"#{task['id']} · {task['name'][:35]} · {task['done'] or 0}/{task['total']}", callback_data=f"taskview:{task['id']}:{page}")
+    if page: b.button(text="⬅️", callback_data=f"tasks:{page-1}")
+    b.button(text=f"{page+1}/{pages}", callback_data="noop")
+    if page + 1 < pages: b.button(text="➡️", callback_data=f"tasks:{page+1}")
+    b.adjust(*([1] * len(rows)), 3)
+    return b.as_markup(), total
+
+
+@router.message(F.text == "📋 Topshiriqlar")
+async def tasks_list(message: Message):
+    if not await is_staff(message.from_user.id): return
+    kb, total = await tasks_keyboard()
+    await message.answer(f"<b>📋 Topshiriqlar tarixi</b> — jami {total}", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("tasks:"))
+async def tasks_page(call: CallbackQuery):
+    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    page = int(call.data.split(":")[1]); kb, total = await tasks_keyboard(page)
+    await call.message.edit_text(f"<b>📋 Topshiriqlar tarixi</b> — jami {total}", reply_markup=kb); await call.answer()
+
+
+@router.callback_query(F.data.startswith("taskview:"))
+async def task_detail(call: CallbackQuery):
+    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    _, raw_id, page = call.data.split(":"); task_id = int(raw_id)
+    task = await db_one("""SELECT t.*,g.title group_title,u.full_name creator FROM tasks t
+      LEFT JOIN groups g ON g.chat_id=t.group_id LEFT JOIN users u ON u.tg_id=t.created_by WHERE t.id=?""", (task_id,))
+    if not task: return await call.answer("Topshiriq topilmadi", show_alert=True)
+    members = await db_all("""SELECT u.full_name,u.username,tu.status,tu.completed_at FROM task_users tu
+      JOIN users u ON u.tg_id=tu.user_id WHERE tu.task_id=? ORDER BY tu.status,u.full_name""", (task_id,))
+    people = "\n".join(f"{'✅' if x['status']=='completed' else '⏳'} {h(x['full_name'],60)}" for x in members[:20])
+    if len(members) > 20: people += f"\n… va yana {len(members)-20} ta ijrochi"
+    text = (f"<b>📌 #{task_id} · {h(task['name'],200)}</b>\n\n{h(task['description'],1800)}\n\n"
+            f"⏰ {h(task['deadline'],200)}\n📂 {h(task['group_title'] or str(task['group_id']),200)}\n"
+            f"👤 Yaratdi: {h(task['creator'] or str(task['created_by']),200)}\n\n<b>Ijrochilar:</b>\n{people}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔔 Eslatma yuborish", callback_data=f"remind:{task_id}:{page}")],
+        [InlineKeyboardButton(text="⬅️ Ro‘yxat", callback_data=f"tasks:{page}")],
+    ])
+    await call.message.edit_text(text, reply_markup=kb); await call.answer()
+
+
+@router.callback_query(F.data.startswith("remind:"))
+async def remind_task_users(call: CallbackQuery, bot: Bot):
+    if not await is_staff(call.from_user.id):
+        return await call.answer("Ruxsat yo‘q", show_alert=True)
+    _, raw_id, page = call.data.split(":")
+    task_id = int(raw_id)
+    task = await db_one("SELECT id,name,description,deadline,group_id FROM tasks WHERE id=?", (task_id,))
+    if not task:
+        return await call.answer("Topshiriq topilmadi", show_alert=True)
+    users = await db_all("""SELECT u.tg_id,u.username,u.full_name FROM task_users tu
+      JOIN users u ON u.tg_id=tu.user_id
+      WHERE tu.task_id=? AND tu.status='assigned' ORDER BY u.full_name""", (task_id,))
+    if not users:
+        return await call.answer("Barcha ijrochilar topshiriqni bajargan", show_alert=True)
+
+    mention_parts = []
+    mention_length = 0
+    for user in users:
+        if user["username"]:
+            mention = f"@{h(user['username'], 50)}"
+        else:
+            mention = f"<a href='tg://user?id={user['tg_id']}'>{h(user['full_name'], 60)}</a>"
+        if mention_length + len(mention) + 1 > 1750:
+            mention_parts.append("…")
+            break
+        mention_parts.append(mention)
+        mention_length += len(mention) + 1
+    mentions = " ".join(mention_parts)
+    group_text = (f"🔔 <b>TOPSHIRIQ BO‘YICHA ESLATMA</b>\n\n"
+                  f"📌 {h(task['name'], 200)}\n⏰ Muddat: {h(task['deadline'], 200)}\n\n"
+                  f"{mentions}\n\n⚠️ Ushbu topshiriqni belgilangan muddatda bajarishingiz talab qilinadi.")
+    failures = []
+    try:
+        await bot.send_message(task["group_id"], group_text)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        failures.append(task["group_id"])
+
+    private_text = (f"🔔 <b>Topshiriq bo‘yicha eslatma</b>\n\n📌 {h(task['name'], 200)}\n"
+                    f"{h(task['description'], 2200)}\n\n⏰ <b>Muddat:</b> {h(task['deadline'], 200)}\n\n"
+                    f"⚠️ Topshiriqni belgilangan muddatda bajarishingiz talab qilinadi.")
+    done_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="☑️ Bajardim", callback_data=f"done:{task_id}")]
+    ])
+    delivered = 0
+    for user in users:
+        try:
+            await bot.send_message(user["tg_id"], private_text, reply_markup=done_kb)
+            delivered += 1
+        except (TelegramForbiddenError, TelegramBadRequest):
+            failures.append(user["tg_id"])
+
+    result = f"🔔 Eslatma yuborildi.\n👥 Hali bajarmaganlar: {len(users)}\n📨 Shaxsiy xabar yetib bordi: {delivered}"
+    if failures:
+        result += f"\n⚠️ Yetib bormagan chatlar: {len(failures)}"
+    await call.answer("Eslatma yuborildi", show_alert=True)
+    await call.message.answer(result)
+
+
+@router.message(Command("set_manager"))
+async def set_manager(message: Message):
+    if await effective_role(message.from_user.id) not in {"admin","superadmin"}: return
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].isdigit(): return await message.answer("Format: /set_manager TELEGRAM_ID")
+    uid = int(parts[1])
+    target = await db_one("SELECT role FROM users WHERE tg_id=?", (uid,))
+    if target and target["role"] in {"admin","superadmin"}: return await message.answer("Admin yoki superadminni manager qilib bo‘lmaydi.")
+    await db_execute("UPDATE users SET role='manager',status='accepted' WHERE tg_id=?", (uid,))
+    await message.answer("✅ Manager tayinlandi.")
+
+
+async def main():
+    global APP_READY
+    if not TOKEN: raise RuntimeError("BOT_TOKEN .env faylida ko‘rsatilmagan")
+    if os.getenv("REQUIRE_DATABASE", "").lower() in {"1","true","yes"} and not DATABASE_URL:
+        raise RuntimeError("Production rejimida DATABASE_URL majburiy")
+    logging.basicConfig(level=logging.INFO)
+    await init_db()
+    bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage()); dp.include_router(router)
+    await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash"), BotCommand(command="panel", description="Admin panel"), BotCommand(command="cancel", description="Joriy amalni bekor qilish"), BotCommand(command="register_group", description="Joriy guruhni ro‘yxatdan o‘tkazish"), BotCommand(command="add_group", description="Guruh ID orqali qo‘shish"), BotCommand(command="add_admin", description="ID orqali admin tayinlash"), BotCommand(command="remove_admin", description="ID orqali adminni olib tashlash")])
+    runner = web.AppRunner(create_health_app())
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000"))).start()
+    await bot.delete_webhook(drop_pending_updates=False)
+    APP_READY = True
+    try:
+        await dp.start_polling(bot)
+    finally:
+        APP_READY = False
+        await runner.cleanup()
+        if pg_pool: await pg_pool.close()
+
+
+if __name__ == "__main__": asyncio.run(main())
