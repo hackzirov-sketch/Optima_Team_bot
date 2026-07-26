@@ -190,7 +190,8 @@ BUTTON_CATALOG = [
     ("edit_portfolio", "💼 Portfolio"), ("edit_about", "🗒 O‘zim haqimda"),
     ("edit_specialty", "💼 Yo‘nalishni o‘zgartirish"), ("deadline_1h", "⏰ 1 soat"),
     ("deadline_today", "Bugun 18:00"), ("deadline_tomorrow", "Ertaga 18:00"),
-    ("deadline_week", "7 kun"), ("premium_emoji", "✨ Premium emojini yuborish"),
+    ("deadline_week", "7 kun"), ("deadline_custom", "🕒 Ma’lum vaqt"),
+    ("premium_emoji", "✨ Premium emojini yuborish"),
     ("unicode_fallback", "🙂 Unicode fallback"),
     ("back", "⬅️ Orqaga"), ("previous", "⬅️"), ("next", "➡️"),
 ]
@@ -273,6 +274,9 @@ def h(value, limit=1000):
 
 def user_mention(user, limit=60):
     data = dict(user)
+    username = str(data.get("username") or "").strip().lstrip("@")
+    if username:
+        return f"@{h(username, limit)}"
     label = data.get("full_name") or (f"@{data['username']}" if data.get("username") else str(data["tg_id"]))
     return f"<a href='tg://user?id={int(data['tg_id'])}'>{h(label, limit)}</a>"
 
@@ -1903,7 +1907,7 @@ async def task_desc(message: Message, state: FSMContext):
 
 
 async def ask_task_deadline(message):
-    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏰ 1 soat",callback_data="deadline:1h"),InlineKeyboardButton(text="Bugun 18:00",callback_data="deadline:today18")],[InlineKeyboardButton(text="Ertaga 18:00",callback_data="deadline:tomorrow18"),InlineKeyboardButton(text="7 kun",callback_data="deadline:7d")],[InlineKeyboardButton(text="🏠 Bosh sahifa",callback_data="nav:home",design_key="home")]])
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⏰ 1 soat",callback_data="deadline:1h"),InlineKeyboardButton(text="Bugun 18:00",callback_data="deadline:today18")],[InlineKeyboardButton(text="Ertaga 18:00",callback_data="deadline:tomorrow18"),InlineKeyboardButton(text="7 kun",callback_data="deadline:7d")],[InlineKeyboardButton(text="🕒 Ma’lum vaqt",callback_data="deadline:custom",design_key="deadline_custom")],[InlineKeyboardButton(text="🏠 Bosh sahifa",callback_data="nav:home",design_key="home")]])
     await message.answer(
         "Muddatni tanlang yoki sana va vaqtni 24 soatlik formatda yozing:\n"
         "<code>30.07.2026 18:00</code>",
@@ -1935,6 +1939,11 @@ async def finish_deadline(message,state,display,deadline_at):
 @router.callback_query(TaskForm.deadline,F.data.startswith("deadline:"))
 async def deadline_shortcut(call:CallbackQuery,state:FSMContext):
     now=datetime.now(TASHKENT_TZ);key=call.data.split(':')[1]
+    if key == 'custom':
+        await call.message.edit_text(
+            "Sana va vaqtni 24 soatlik formatda yozing:\n<code>30.07.2026 18:00</code>"
+        )
+        return await call.answer()
     if key=='1h':target=now+timedelta(hours=1)
     elif key=='7d':target=now+timedelta(days=7)
     elif key=='today18':target=now.replace(hour=18,minute=0,second=0,microsecond=0);target=target if target>now else target+timedelta(days=1)
@@ -1948,8 +1957,9 @@ async def user_picker(selected: set[int], selection_mode="multiple"):
     b = InlineKeyboardBuilder()
     for u in users:
         mark = "🔘" if selection_mode == "single" and u["tg_id"] in selected else ("✅" if u["tg_id"] in selected else "▫️")
-        b.button(text=f"{mark} {u['full_name']} · {SPECIALTIES.get(u['specialty'], '—')}", callback_data=f"pick:{u['tg_id']}")
-    b.button(text="Davom etish ➡️", callback_data="pick:done")
+        username = f"@{u['username']}" if u['username'] else "username yo‘q"
+        b.button(text=f"{mark} {u['full_name']} · {username} · {SPECIALTIES.get(u['specialty'], '—')}", callback_data=f"pick:{u['tg_id']}")
+    b.button(text=f"Davom etish ({len(selected)}) ➡️", callback_data="pick:done")
     b.button(text="⬅️ Tanlash turiga qaytish", callback_data="pick:mode"); b.adjust(1)
     return b.as_markup()
 
