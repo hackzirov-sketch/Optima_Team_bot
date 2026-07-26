@@ -96,6 +96,10 @@ class TaskResult(StatesGroup):
     content = State()
 
 
+class TaskReviewForm(StatesGroup):
+    note = State()
+
+
 class ProfileEdit(StatesGroup):
     value = State()
 
@@ -2038,7 +2042,7 @@ async def review_task_result(call:CallbackQuery,bot:Bot):
 
 
 @router.callback_query(F.data.startswith("rate:"))
-async def rate_task_result(call:CallbackQuery,bot:Bot):
+async def rate_task_result(call:CallbackQuery,bot:Bot,state:FSMContext):
     if not await is_actual_staff(call.from_user.id):return await call.answer("Ruxsat yo‘q",show_alert=True)
     _,raw_score,raw_tid,raw_uid=call.data.split(':');score=int(raw_score);tid=int(raw_tid);uid=int(raw_uid)
     if score not in range(1,6):return await call.answer("Baho noto‘g‘ri",show_alert=True)
@@ -2049,7 +2053,20 @@ async def rate_task_result(call:CallbackQuery,bot:Bot):
     await call.message.edit_reply_markup(reply_markup=None)
     with suppress(TelegramBadRequest,TelegramForbiddenError):await bot.send_message(uid,f"✅ Natija tasdiqlandi\n📌 Vazifa #{tid}\n⭐ Baho: {score}/5")
     await refresh_group_task_message(bot,tid);await audit(call.from_user.id,"task_approved","task",tid,f"user:{uid};rating:{score}")
+    await state.set_state(TaskReviewForm.note);await state.update_data(review_task_id=tid,review_task_user_id=uid,review_task_rating=score)
+    await call.message.answer("Bahoga qisqa izoh yozing yoki /skip yuboring.")
     await call.answer(f"Tasdiqlandi · {score}/5",show_alert=True)
+
+
+@router.message(TaskReviewForm.note,F.text)
+async def save_task_review_note(message:Message,state:FSMContext,bot:Bot):
+    if not await is_actual_staff(message.from_user.id):await state.clear();return
+    data=await state.get_data();tid=data.get('review_task_id');uid=data.get('review_task_user_id');score=data.get('review_task_rating')
+    if not tid or not uid:await state.clear();return await message.answer("Baholash sessiyasi tugagan.")
+    note="Izoh qoldirilmadi" if message.text=="/skip" else message.text.strip()
+    await db_execute("UPDATE task_users SET review_note=? WHERE task_id=? AND user_id=?",(note,tid,uid))
+    with suppress(TelegramBadRequest,TelegramForbiddenError):await bot.send_message(uid,f"💬 Vazifa #{tid} bo‘yicha admin izohi:\n{h(note,1800)}\n⭐ Baho: {score}/5")
+    await audit(message.from_user.id,"task_review_note","task",tid,f"user:{uid};note:{note[:300]}");await state.clear();await message.answer("✅ Baho izohi saqlandi va userga yuborildi.")
 
 
 async def refresh_group_task_message(bot:Bot,task_id:int):

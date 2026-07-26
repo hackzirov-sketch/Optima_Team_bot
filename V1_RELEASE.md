@@ -12,7 +12,7 @@ Holat: **V1 feature freeze — yakunlangan va production uchun tayyor**
 - Qabul/rad qaroridan keyin admin izohi va qaror audit ma’lumotlari.
 - Admin, manager va dasturchilar bo‘yicha alohida jamoa ro‘yxatlari; superadmin maxfiyligi.
 - Bitta yoki bir nechta userga guruh va shaxsiy chat orqali topshiriq yuborish.
-- Topshiriq holatlari, natija fayllari, qayta ishlash, 1–5 baholash va guruh xabarini yangilash.
+- Topshiriq holatlari, natija fayllari, qayta ishlash, 1–5 baholash, admin izohi va guruh xabarini yangilash.
 - Userdan topshiriq muallifiga savol yuborish va bot ichida javob qaytarish.
 - Qo‘lda va avtomatik eslatmalar; userlarni Telegram mention orqali belgilash.
 - Kengaytirilgan statistika: bajarilish, kechikish, o‘rtacha vaqt, reyting, yo‘nalish va user kesimi.
