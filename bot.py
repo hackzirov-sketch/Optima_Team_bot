@@ -69,6 +69,7 @@ class TaskForm(StatesGroup):
     name = State()
     description = State()
     deadline = State()
+    selection_mode = State()
     users = State()
     group = State()
     confirm = State()
@@ -178,6 +179,12 @@ def h(value, limit=1000):
         if len(html.escape(raw[:mid])) <= max(0, limit - 1): low = mid
         else: high = mid - 1
     return html.escape(raw[:low]) + "…"
+
+
+def user_mention(user, limit=60):
+    data = dict(user)
+    label = f"@{data['username']}" if data.get("username") else data.get("full_name") or str(data["tg_id"])
+    return f"<a href='tg://user?id={int(data['tg_id'])}'>{h(label, limit)}</a>"
 
 
 async def db_execute(sql: str, params=()):
@@ -294,7 +301,7 @@ async def init_db():
 
 async def ensure_user(tg_user):
     await db_execute("""INSERT INTO users(tg_id,username,full_name) VALUES(?,?,?)
-      ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username""",
+      ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username,full_name=excluded.full_name""",
       (tg_user.id, tg_user.username, tg_user.full_name))
 
 
@@ -481,7 +488,8 @@ async def require_superadmin(user_id):
 async def admins_markup():
     admins = await db_all("SELECT tg_id,full_name,username FROM users WHERE role='admin' ORDER BY full_name")
     lines = ["<b>🛡 Adminlar ro‘yxati</b>"]
-    lines += [f"• {h(x['full_name'],100)} · <code>{x['tg_id']}</code> · @{h(x['username'] or '-',50)}" for x in admins]
+    lines += [f"• {h(x['full_name'],100)} · <code>{x['tg_id']}</code> · " +
+              (f"@{h(x['username'],50)}" if x["username"] else "username yo‘q") for x in admins]
     if not admins: lines.append("Hozircha adminlar yo‘q.")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Admin tayinlash", callback_data="admin:add", style="success")],
@@ -506,16 +514,24 @@ async def admin_action(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-async def set_admin_role(message: Message, state: FSMContext, adding: bool, raw_id=None):
+async def set_admin_role(message: Message, state: FSMContext, adding: bool, raw_id=None, bot: Bot = None):
     if not await require_superadmin(message.from_user.id): await state.clear(); return
     value = str(raw_id if raw_id is not None else (message.text or "")).strip()
     if not value.isdigit(): return await message.answer("Faqat raqamlardan iborat Telegram ID yuboring.")
     uid = int(value)
     if uid in SUPERADMINS: return await message.answer("Superadmin rolini o‘zgartirib bo‘lmaydi.")
     if adding:
-        await db_execute("""INSERT INTO users(tg_id,full_name,role,status) VALUES(?,?,'admin','accepted')
-          ON CONFLICT(tg_id) DO UPDATE SET role='admin',status='accepted'""", (uid, f"Admin {uid}"))
-        result = f"✅ <code>{uid}</code> admin etib tayinlandi."
+        full_name, username = f"Admin {uid}", None
+        if bot:
+            with suppress(TelegramBadRequest, TelegramForbiddenError):
+                chat = await bot.get_chat(uid)
+                full_name = chat.full_name or full_name
+                username = chat.username
+        await db_execute("""INSERT INTO users(tg_id,full_name,username,role,status) VALUES(?,?,?,'admin','accepted')
+          ON CONFLICT(tg_id) DO UPDATE SET full_name=excluded.full_name,
+          username=COALESCE(excluded.username,users.username),role='admin',status='accepted'""", (uid, full_name, username))
+        username_text = f"@{h(username, 50)}" if username else "username topilmadi — /start bosganda yangilanadi"
+        result = f"✅ {h(full_name, 100)} · <code>{uid}</code> · {username_text}\nAdmin etib tayinlandi."
     else:
         user = await db_one("SELECT role FROM users WHERE tg_id=?", (uid,))
         if not user or user["role"] != "admin": return await message.answer("Bu ID adminlar ro‘yxatida yo‘q.")
@@ -525,25 +541,25 @@ async def set_admin_role(message: Message, state: FSMContext, adding: bool, raw_
 
 
 @router.message(AdminManage.add_id)
-async def add_admin_id(message: Message, state: FSMContext): await set_admin_role(message, state, True)
+async def add_admin_id(message: Message, state: FSMContext, bot: Bot): await set_admin_role(message, state, True, bot=bot)
 
 
 @router.message(AdminManage.remove_id)
-async def remove_admin_id(message: Message, state: FSMContext): await set_admin_role(message, state, False)
+async def remove_admin_id(message: Message, state: FSMContext, bot: Bot): await set_admin_role(message, state, False, bot=bot)
 
 
 @router.message(Command("add_admin"))
-async def add_admin_command(message: Message, state: FSMContext):
+async def add_admin_command(message: Message, state: FSMContext, bot: Bot):
     parts = message.text.split(maxsplit=1)
     if len(parts) != 2: return await message.answer("Format: /add_admin TELEGRAM_ID")
-    await set_admin_role(message, state, True, parts[1])
+    await set_admin_role(message, state, True, parts[1], bot)
 
 
 @router.message(Command("remove_admin"))
-async def remove_admin_command(message: Message, state: FSMContext):
+async def remove_admin_command(message: Message, state: FSMContext, bot: Bot):
     parts = message.text.split(maxsplit=1)
     if len(parts) != 2: return await message.answer("Format: /remove_admin TELEGRAM_ID")
-    await set_admin_role(message, state, False, parts[1])
+    await set_admin_role(message, state, False, parts[1], bot)
 
 
 def design_catalog_keyboard(page=0):
@@ -883,10 +899,12 @@ async def review(call: CallbackQuery, bot: Bot):
     await call.answer()
 
 
-async def users_keyboard(page=0):
-    total = (await db_one("SELECT COUNT(*) AS c FROM users"))["c"]
+async def users_keyboard(page=0, viewer_id=None):
+    can_see_superadmins = viewer_id is not None and await effective_role(viewer_id) == "superadmin"
+    where = "" if can_see_superadmins else " WHERE role!='superadmin'"
+    total = (await db_one(f"SELECT COUNT(*) AS c FROM users{where}"))["c"]
     pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE); page = max(0, min(page, pages - 1))
-    rows = await db_all("SELECT tg_id,full_name,status,role,specialty FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?", (PAGE_SIZE, page * PAGE_SIZE))
+    rows = await db_all(f"SELECT tg_id,full_name,status,role,specialty FROM users{where} ORDER BY created_at DESC LIMIT ? OFFSET ?", (PAGE_SIZE, page * PAGE_SIZE))
     b = InlineKeyboardBuilder()
     for u in rows:
         title = f"{u['full_name']} · {SPECIALTIES.get(u['specialty'], '—')} · {STATUS_LABELS[u['status']]}"
@@ -963,14 +981,14 @@ async def pending_detail(call: CallbackQuery):
 @router.message(F.text.in_(menu_texts("👥 Userlar")))
 async def users_list(message: Message):
     if not await is_staff(message.from_user.id): return
-    kb, total = await users_keyboard()
+    kb, total = await users_keyboard(viewer_id=message.from_user.id)
     await message.answer(f"<b>👥 Userlar</b> — jami {total}\nBatafsil ko‘rish uchun userni tanlang:", reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("users:"))
 async def users_page(call: CallbackQuery):
     if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
-    page = int(call.data.split(":")[1]); kb, total = await users_keyboard(page)
+    page = int(call.data.split(":")[1]); kb, total = await users_keyboard(page, call.from_user.id)
     await call.message.edit_text(f"<b>👥 Userlar</b> — jami {total}\nBatafsil ko‘rish uchun userni tanlang:", reply_markup=kb); await call.answer()
 
 
@@ -979,6 +997,8 @@ async def user_detail(call: CallbackQuery):
     if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
     _, raw_uid, raw_page = call.data.split(":"); u = await db_one("SELECT * FROM users WHERE tg_id=?", (int(raw_uid),))
     if not u: return await call.answer("User topilmadi", show_alert=True)
+    if u["role"] == "superadmin" and await effective_role(call.from_user.id) != "superadmin":
+        return await call.answer("Bu profil ko‘rinmaydi", show_alert=True)
     b = InlineKeyboardBuilder()
     if await effective_role(call.from_user.id) in {"admin","superadmin"} and u["role"] not in {"admin","superadmin"}:
         b.button(text="User qilish" if u["role"] == "manager" else "Manager qilish", callback_data=f"role:{u['tg_id']}:{raw_page}")
@@ -1144,14 +1164,15 @@ async def task_desc(message: Message, state: FSMContext):
     await message.answer("Bajarish vaqtini yozing (masalan: 30.07.2026 18:00):")
 
 
-async def user_picker(selected: set[int]):
+async def user_picker(selected: set[int], selection_mode="multiple"):
     users = await db_all("""SELECT tg_id,full_name,username,specialty FROM users WHERE status='accepted'
       AND (role='user' OR (role='superadmin' AND active_mode='user')) ORDER BY full_name""")
     b = InlineKeyboardBuilder()
     for u in users:
-        mark = "✅" if u["tg_id"] in selected else "▫️"
+        mark = "🔘" if selection_mode == "single" and u["tg_id"] in selected else ("✅" if u["tg_id"] in selected else "▫️")
         b.button(text=f"{mark} {u['full_name']} · {SPECIALTIES.get(u['specialty'], '—')}", callback_data=f"pick:{u['tg_id']}")
-    b.button(text="Davom etish ➡️", callback_data="pick:done"); b.adjust(1)
+    b.button(text="Davom etish ➡️", callback_data="pick:done")
+    b.button(text="⬅️ Tanlash turiga qaytish", callback_data="pick:mode"); b.adjust(1)
     return b.as_markup()
 
 
@@ -1161,16 +1182,40 @@ async def task_deadline(message: Message, state: FSMContext):
       AND (role='user' OR (role='superadmin' AND active_mode='user'))"""))["c"]
     if not users_count:
         await state.clear(); return await message.answer("Qabul qilingan userlar yo‘q. Avval kamida bitta arizani tasdiqlang.")
-    await state.update_data(deadline=message.text, selected=[]); await state.set_state(TaskForm.users)
-    await message.answer("Bir yoki bir nechta userni tanlang:", reply_markup=await user_picker(set()))
+    await state.update_data(deadline=message.text, selected=[]); await state.set_state(TaskForm.selection_mode)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Bitta user", callback_data="selectmode:single")],
+        [InlineKeyboardButton(text="👥 Bir nechta user", callback_data="selectmode:multiple")],
+        [InlineKeyboardButton(text="⬅️ Bosh menyu", callback_data="nav:home")],
+    ])
+    await message.answer("Ijrochilarni tanlash turini belgilang:", reply_markup=kb)
+
+
+@router.callback_query(TaskForm.selection_mode, F.data.startswith("selectmode:"))
+async def choose_selection_mode(call: CallbackQuery, state: FSMContext):
+    mode = call.data.split(":", 1)[1]
+    if mode not in {"single", "multiple"}: return await call.answer("Noto‘g‘ri tanlov", show_alert=True)
+    await state.update_data(selection_mode=mode, selected=[])
+    await state.set_state(TaskForm.users)
+    title = "Bitta userni tanlang:" if mode == "single" else "Bir yoki bir nechta userni tanlang:"
+    await call.message.edit_text(title, reply_markup=await user_picker(set(), mode)); await call.answer()
 
 
 @router.callback_query(TaskForm.users, F.data.startswith("pick:"))
 async def pick_user(call: CallbackQuery, state: FSMContext):
-    value = call.data.split(":",1)[1]; data = await state.get_data(); selected = set(data.get("selected", []))
+    value = call.data.split(":",1)[1]; data = await state.get_data(); selected = set(data.get("selected", [])); mode = data.get("selection_mode", "multiple")
+    if value == "mode":
+        await state.set_state(TaskForm.selection_mode)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Bitta user", callback_data="selectmode:single")],
+            [InlineKeyboardButton(text="👥 Bir nechta user", callback_data="selectmode:multiple")],
+        ])
+        await call.message.edit_text("Ijrochilarni tanlash turini belgilang:", reply_markup=kb); return await call.answer()
     if value != "done":
-        uid = int(value); selected.symmetric_difference_update({uid}); await state.update_data(selected=list(selected))
-        await call.message.edit_reply_markup(reply_markup=await user_picker(selected)); return await call.answer()
+        uid = int(value)
+        selected = {uid} if mode == "single" else selected.symmetric_difference({uid})
+        await state.update_data(selected=list(selected))
+        await call.message.edit_reply_markup(reply_markup=await user_picker(selected, mode)); return await call.answer()
     if not selected: return await call.answer("Kamida bitta user tanlang", show_alert=True)
     groups = await db_all("SELECT chat_id,title FROM groups ORDER BY title")
     if not groups: return await call.answer("Avval guruhni /register_group orqali ro‘yxatdan o‘tkazing", show_alert=True)
@@ -1185,7 +1230,7 @@ async def pick_group(call: CallbackQuery, state: FSMContext):
     gid = int(call.data.split(":")[1]); await state.update_data(group_id=gid); data = await state.get_data()
     placeholders = ",".join("?" for _ in data["selected"])
     users = await db_all(f"SELECT tg_id,username,full_name FROM users WHERE tg_id IN ({placeholders})", data["selected"])
-    mentions = " ".join(f"@{h(u['username'], 50)}" if u['username'] else f"<a href='tg://user?id={u['tg_id']}'>{h(u['full_name'], 50)}</a>" for u in users)
+    mentions = " ".join(user_mention(u, 60) for u in users)
     mentions = mentions[:900]
     text = f"<b>📌 {h(data['name'], 200)}</b>\n\n{h(data['description'], 2500)}\n\n⏰ <b>Vaqti:</b> {h(data['deadline'], 200)}\n👥 {mentions}"
     await state.update_data(task_text=text); await state.set_state(TaskForm.confirm)
@@ -1215,7 +1260,7 @@ async def task_send(call: CallbackQuery, state: FSMContext, bot: Bot):
 @router.callback_query(F.data.startswith("done:"))
 async def complete_task(call: CallbackQuery, bot: Bot):
     task_id = int(call.data.split(":")[1])
-    assignment = await db_one("""SELECT tu.status,t.name,t.group_id,t.created_by,u.full_name,u.username
+    assignment = await db_one("""SELECT tu.status,t.name,t.group_id,t.created_by,u.tg_id,u.full_name,u.username
       FROM task_users tu JOIN tasks t ON t.id=tu.task_id JOIN users u ON u.tg_id=tu.user_id
       WHERE tu.task_id=? AND tu.user_id=?""", (task_id, call.from_user.id))
     if not assignment: return await call.answer("Bu topshiriq sizga biriktirilmagan", show_alert=True)
@@ -1224,7 +1269,7 @@ async def complete_task(call: CallbackQuery, bot: Bot):
     await db_execute("UPDATE task_users SET status='completed',completed_at=? WHERE task_id=? AND user_id=?", (now, task_id, call.from_user.id))
     await call.message.edit_reply_markup(reply_markup=None)
     await call.message.answer("✅ Topshiriq bajarildi deb belgilandi.")
-    who = f"@{assignment['username']}" if assignment["username"] else h(assignment["full_name"], 100)
+    who = user_mention(assignment, 100)
     notice = f"☑️ <b>Topshiriq bajarildi</b>\n📌 {h(assignment['name'], 200)}\n👤 {who}"
     for chat_id in {assignment["group_id"], assignment["created_by"]}:
         with suppress(TelegramForbiddenError, TelegramBadRequest): await bot.send_message(chat_id, notice)
@@ -1301,10 +1346,7 @@ async def remind_task_users(call: CallbackQuery, bot: Bot):
     mention_parts = []
     mention_length = 0
     for user in users:
-        if user["username"]:
-            mention = f"@{h(user['username'], 50)}"
-        else:
-            mention = f"<a href='tg://user?id={user['tg_id']}'>{h(user['full_name'], 60)}</a>"
+        mention = user_mention(user, 60)
         if mention_length + len(mention) + 1 > 1750:
             mention_parts.append("…")
             break
@@ -1351,6 +1393,13 @@ async def set_manager(message: Message):
     if target and target["role"] in {"admin","superadmin"}: return await message.answer("Admin yoki superadminni manager qilib bo‘lmaydi.")
     await db_execute("UPDATE users SET role='manager',status='accepted' WHERE tg_id=?", (uid,))
     await message.answer("✅ Manager tayinlandi.")
+
+
+@router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
+async def capture_group_user(message: Message):
+    """Keep Telegram names current when a person is active in a registered group."""
+    if message.from_user and not message.from_user.is_bot:
+        await ensure_user(message.from_user)
 
 
 async def main():
