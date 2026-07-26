@@ -234,7 +234,8 @@ async def init_db():
         await db.executescript("""
         CREATE TABLE IF NOT EXISTS users(
           tg_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT NOT NULL,
-          phone TEXT, portfolio TEXT, about TEXT,
+          phone TEXT, portfolio TEXT, portfolio_file_id TEXT,
+          portfolio_file_name TEXT, portfolio_file_mime TEXT, about TEXT,
           role TEXT NOT NULL DEFAULT 'user', status TEXT NOT NULL DEFAULT 'draft',
           active_mode TEXT NOT NULL DEFAULT 'user',
           specialty TEXT,
@@ -261,6 +262,12 @@ async def init_db():
             await db.execute("ALTER TABLE users ADD COLUMN active_mode TEXT NOT NULL DEFAULT 'user'")
         if "specialty" not in user_columns:
             await db.execute("ALTER TABLE users ADD COLUMN specialty TEXT")
+        if "portfolio_file_id" not in user_columns:
+            await db.execute("ALTER TABLE users ADD COLUMN portfolio_file_id TEXT")
+        if "portfolio_file_name" not in user_columns:
+            await db.execute("ALTER TABLE users ADD COLUMN portfolio_file_name TEXT")
+        if "portfolio_file_mime" not in user_columns:
+            await db.execute("ALTER TABLE users ADD COLUMN portfolio_file_mime TEXT")
         columns = {row[1] for row in await (await db.execute("PRAGMA table_info(task_users)")).fetchall()}
         if "status" not in columns:
             await db.execute("ALTER TABLE task_users ADD COLUMN status TEXT NOT NULL DEFAULT 'assigned'")
@@ -348,7 +355,7 @@ def kb_button(text, **kwargs):
 
 
 def main_kb(staff=False, superadmin=False):
-    rows = [[kb_button("📝 Ariza to‘ldirish")]]
+    rows = [] if staff else [[kb_button("📝 Ariza to‘ldirish")]]
     if staff:
         rows += [[kb_button("📊 Admin panel"), kb_button("👥 Userlar")],
                  [kb_button("➕ Topshiriq"), kb_button("📋 Topshiriqlar")],
@@ -360,7 +367,7 @@ def main_kb(staff=False, superadmin=False):
 
 
 def main_inline_kb(staff=False, superadmin=False):
-    rows = [[InlineKeyboardButton(text="📝 Ariza to‘ldirish", callback_data="menu:application")]]
+    rows = [] if staff else [[InlineKeyboardButton(text="📝 Ariza to‘ldirish", callback_data="menu:application")]]
     if staff:
         rows += [[InlineKeyboardButton(text="📊 Admin panel", callback_data="menu:panel"),
                   InlineKeyboardButton(text="👥 Userlar", callback_data="menu:users")],
@@ -391,8 +398,11 @@ def app_text(data, user=None):
     full_name = (user.full_name if user else None) or data.get("full_name", "")
     specialty = SPECIALTIES.get(data.get("specialty"), "Tanlanmagan")
     suffix = "\n\n<i>Uzun matn admin paneldagi user kartasida saqlandi.</i>" if len(str(data.get("portfolio", ""))) > 1200 or len(str(data.get("about", ""))) > 2100 else ""
+    portfolio = data.get("portfolio") or "—"
+    if data.get("portfolio_file_id"):
+        portfolio = f"📎 {data.get('portfolio_file_name') or 'Portfolio fayli'} (PDF/DOCX)"
     return (f"<b>Ariza</b>\n\n👤 {h(full_name, 200)}\n💼 {h(specialty, 100)}\n🔗 @{h(username, 100)}\n☎️ {h(data.get('phone'), 100)}\n"
-            f"💼 <b>Portfolio:</b>\n{h(data.get('portfolio'), 1200)}\n\n🗒 <b>O‘zi haqida:</b>\n{h(data.get('about'), 2100)}{suffix}")
+            f"💼 <b>Portfolio:</b>\n{h(portfolio, 1200)}\n\n🗒 <b>O‘zi haqida:</b>\n{h(data.get('about'), 2100)}{suffix}")
 
 
 @router.message(CommandStart())
@@ -714,21 +724,36 @@ async def app_phone_contact(message: Message, state: FSMContext):
         return await message.answer("Iltimos, aynan o‘zingizning kontaktingizni yuboring.")
     await state.update_data(phone=message.contact.phone_number)
     await state.set_state(Application.portfolio)
-    await message.answer("Portfolio havolasi yoki portfolio haqidagi ma’lumotni yuboring:", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Portfolio havolasi/matnini yozing yoki PDF/DOCX fayl yuboring:", reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(Application.phone, F.text)
 async def app_phone_text(message: Message, state: FSMContext):
     await state.update_data(phone=message.text)
     await state.set_state(Application.portfolio)
-    await message.answer("Portfolio havolasi yoki portfolio haqidagi ma’lumotni yuboring:", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Portfolio havolasi/matnini yozing yoki PDF/DOCX fayl yuboring:", reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(Application.portfolio, F.text)
 async def app_portfolio(message: Message, state: FSMContext):
-    await state.update_data(portfolio=message.text)
+    await state.update_data(portfolio=message.text, portfolio_file_id=None,
+                            portfolio_file_name=None, portfolio_file_mime=None)
     await state.set_state(Application.about)
     await message.answer("O‘zingiz haqingizda yozing (hajm cheklanmagan):")
+
+
+@router.message(Application.portfolio, F.document)
+async def app_portfolio_document(message: Message, state: FSMContext):
+    document = message.document
+    filename = document.file_name or "portfolio"
+    extension = os.path.splitext(filename)[1].lower()
+    allowed_mimes = {"application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
+    if extension not in {".pdf", ".docx"} or (document.mime_type and document.mime_type not in allowed_mimes):
+        return await message.answer("Faqat PDF yoki DOCX formatidagi portfolio faylini yuboring.")
+    await state.update_data(portfolio=None, portfolio_file_id=document.file_id,
+                            portfolio_file_name=filename, portfolio_file_mime=document.mime_type)
+    await state.set_state(Application.about)
+    await message.answer(f"✅ <b>{h(filename, 200)}</b> qabul qilindi.\n\nO‘zingiz haqingizda yozing (hajm cheklanmagan):")
 
 
 @router.message(Application.about, F.text)
@@ -752,8 +777,11 @@ async def app_edit(call: CallbackQuery, state: FSMContext):
 @router.callback_query(Application.confirm, F.data == "app:send")
 async def app_send(call: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
-    await db_execute("""UPDATE users SET username=?,full_name=?,phone=?,portfolio=?,about=?,status='pending' WHERE tg_id=?""",
-                     (call.from_user.username, call.from_user.full_name, data["phone"], data["portfolio"], data["about"], call.from_user.id))
+    await db_execute("""UPDATE users SET username=?,full_name=?,phone=?,portfolio=?,portfolio_file_id=?,
+      portfolio_file_name=?,portfolio_file_mime=?,about=?,status='pending' WHERE tg_id=?""",
+      (call.from_user.username, call.from_user.full_name, data["phone"], data.get("portfolio"),
+       data.get("portfolio_file_id"), data.get("portfolio_file_name"), data.get("portfolio_file_mime"),
+       data["about"], call.from_user.id))
     staff = await db_all("SELECT tg_id FROM users WHERE role IN ('superadmin','admin','manager')")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Rad etish", callback_data=f"review:reject:{call.from_user.id}"),
                                                 InlineKeyboardButton(text="✅ Qabul qilish", callback_data=f"review:accept:{call.from_user.id}")]])
@@ -761,6 +789,9 @@ async def app_send(call: CallbackQuery, state: FSMContext, bot: Bot):
     for member in staff:
         with suppress(TelegramForbiddenError, TelegramBadRequest):
             await bot.send_message(member["tg_id"], app_text(data, call.from_user), reply_markup=kb)
+            if data.get("portfolio_file_id"):
+                await bot.send_document(member["tg_id"], data["portfolio_file_id"],
+                                        caption=f"📎 {h(data.get('portfolio_file_name'), 200)}")
             delivered += 1
     await call.message.edit_reply_markup(reply_markup=None)
     await call.message.answer("✅ Arizangiz yuborildi." if delivered else "⚠️ Ariza saqlandi, ammo mas’ullarga xabar yetkazilmadi.", reply_markup=main_kb(False))
@@ -851,6 +882,7 @@ async def pending_detail(call: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Rad etish", callback_data=f"review:reject:{uid}"),
          InlineKeyboardButton(text="✅ Qabul qilish", callback_data=f"review:accept:{uid}")],
+        *([[InlineKeyboardButton(text="📎 Portfolio faylini ochish", callback_data=f"portfolio:{uid}")]] if u["portfolio_file_id"] else []),
         [InlineKeyboardButton(text="⬅️ Arizalar", callback_data=f"pending:{page}")],
     ])
     await call.message.edit_text(app_text(data), reply_markup=kb); await call.answer()
@@ -879,11 +911,24 @@ async def user_detail(call: CallbackQuery):
     if await effective_role(call.from_user.id) in {"admin","superadmin"} and u["role"] not in {"admin","superadmin"}:
         b.button(text="User qilish" if u["role"] == "manager" else "Manager qilish", callback_data=f"role:{u['tg_id']}:{raw_page}")
         b.button(text="✅ Faollashtirish" if u["status"] == "blocked" else "⛔ Bloklash", callback_data=f"block:{u['tg_id']}:{raw_page}")
+    if u["portfolio_file_id"]:
+        b.button(text="📎 Portfolio faylini ochish", callback_data=f"portfolio:{u['tg_id']}")
     b.button(text="⬅️ Ro‘yxat", callback_data=f"users:{raw_page}"); b.adjust(1)
     text = (f"<b>{h(u['full_name'], 200)}</b>\nID: <code>{u['tg_id']}</code>\nUsername: @{h(u['username'] or '-', 100)}\n"
             f"Telefon: {h(u['phone'] or '-', 100)}\nVakolat: {ROLE_LABELS[u['role']]}\nYo‘nalish: {SPECIALTIES.get(u['specialty'], 'Tanlanmagan')}\nHolat: {STATUS_LABELS[u['status']]}\n\n"
             f"<b>Portfolio:</b>\n{h(u['portfolio'] or '-', 1200)}\n\n<b>O‘zi haqida:</b>\n{h(u['about'] or '-', 2100)}")
     await call.message.edit_text(text, reply_markup=b.as_markup()); await call.answer()
+
+
+@router.callback_query(F.data.startswith("portfolio:"))
+async def send_portfolio_file(call: CallbackQuery, bot: Bot):
+    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    uid = int(call.data.split(":", 1)[1])
+    user = await db_one("SELECT full_name,portfolio_file_id,portfolio_file_name FROM users WHERE tg_id=?", (uid,))
+    if not user or not user["portfolio_file_id"]: return await call.answer("Portfolio fayli topilmadi", show_alert=True)
+    await bot.send_document(call.message.chat.id, user["portfolio_file_id"],
+                            caption=f"📎 <b>{h(user['full_name'], 150)}</b> — {h(user['portfolio_file_name'], 200)}")
+    await call.answer("Portfolio yuborildi")
 
 
 @router.callback_query(F.data.startswith("role:"))
