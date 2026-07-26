@@ -299,6 +299,10 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS task_templates(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,description TEXT NOT NULL,created_by INTEGER,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,actor_id INTEGER,action TEXT NOT NULL,target_type TEXT,target_id TEXT,details TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS application_review_messages(
+          application_user_id INTEGER NOT NULL, staff_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+          sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(application_user_id,staff_id)
+        );
         """)
         user_columns = {row[1] for row in await (await db.execute("PRAGMA table_info(users)")).fetchall()}
         if "active_mode" not in user_columns:
@@ -995,19 +999,17 @@ async def app_send(call: CallbackQuery, state: FSMContext, bot: Bot):
        data["about"], call.from_user.id))
     await audit(call.from_user.id,"application_submitted","user",call.from_user.id)
     staff = await db_all("SELECT tg_id FROM users WHERE role IN ('superadmin','admin','manager')")
-    pending_count=(await db_one("SELECT COUNT(*) c FROM users WHERE status='pending'"))["c"]
     direct_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Rad etish", callback_data=f"review:reject:{call.from_user.id}"),
                                                        InlineKeyboardButton(text="✅ Qabul qilish", callback_data=f"review:accept:{call.from_user.id}")]])
-    compact_kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Arizani ko‘rish",callback_data=f"pendingview:{call.from_user.id}:0")],
-                                                     [InlineKeyboardButton(text="📂 Arizalar bo‘limini ochish",callback_data="pending:0")]])
     delivered = 0
     for member in staff:
         with suppress(TelegramForbiddenError, TelegramBadRequest):
-            if pending_count < 10:
-                await bot.send_message(member["tg_id"], app_text(data, call.from_user), reply_markup=direct_kb)
-            else:
-                await bot.send_message(member["tg_id"],f"🔔 <b>Yangi ariza keldi</b>\n👤 {h(data['full_name'],150)}\n💼 {SPECIALTIES.get(data.get('specialty'),'Tanlanmagan')}\n\n⏳ Kutilayotgan arizalar: <b>{pending_count} ta</b>",reply_markup=compact_kb)
-            if pending_count < 10 and data.get("portfolio_file_id"):
+            sent = await bot.send_message(member["tg_id"], app_text(data, call.from_user), reply_markup=direct_kb)
+            await db_execute("""INSERT INTO application_review_messages(application_user_id,staff_id,message_id)
+              VALUES(?,?,?) ON CONFLICT(application_user_id,staff_id) DO UPDATE SET
+              message_id=excluded.message_id,sent_at=CURRENT_TIMESTAMP""",
+              (call.from_user.id, member["tg_id"], sent.message_id))
+            if data.get("portfolio_file_id"):
                 await bot.send_document(member["tg_id"], data["portfolio_file_id"],
                                         caption=f"📎 {h(data.get('portfolio_file_name'), 200)}")
             delivered += 1
@@ -1021,13 +1023,30 @@ async def app_send(call: CallbackQuery, state: FSMContext, bot: Bot):
 async def review(call: CallbackQuery, bot: Bot):
     if not await is_actual_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
     _, action, raw_id = call.data.split(":"); uid = int(raw_id)
-    current = await db_one("SELECT status,full_name FROM users WHERE tg_id=?", (uid,))
+    current = await db_one("SELECT * FROM users WHERE tg_id=?", (uid,))
     if not current: return await call.answer("User topilmadi", show_alert=True)
-    if current["status"] != "pending": return await call.answer(f"Bu ariza allaqachon: {STATUS_LABELS.get(current['status'], current['status'])}", show_alert=True)
+    if current["status"] != "pending":
+        with suppress(TelegramBadRequest): await call.message.edit_reply_markup(reply_markup=None)
+        return await call.answer(f"Bu ariza allaqachon: {STATUS_LABELS.get(current['status'], current['status'])}", show_alert=True)
     status = "accepted" if action == "accept" else "rejected"
     rejected_at = datetime.now(timezone.utc).isoformat(timespec="seconds") if status == "rejected" else None
     await db_execute("UPDATE users SET status=?,rejected_at=? WHERE tg_id=?", (status, rejected_at, uid));await audit(call.from_user.id,f"application_{status}","user",uid)
     label = "✅ Qabul qilindi" if status == "accepted" else "❌ Rad etildi"
+    reviewer = call.from_user.full_name or (f"@{call.from_user.username}" if call.from_user.username else str(call.from_user.id))
+    reviewed_at = datetime.now(timezone(timedelta(hours=5))).strftime("%d.%m.%Y %H:%M")
+    review_status = (f"\n\n────────────\n<b>{label}</b>\n"
+                     f"👤 Qaror qildi: {h(reviewer, 150)}\n🕒 {reviewed_at}")
+    notification_rows = await db_all("SELECT staff_id,message_id FROM application_review_messages WHERE application_user_id=?", (uid,))
+    reviewed_text = app_text(dict(current)) + review_status
+    updated_messages = 0
+    for notification in notification_rows:
+        with suppress(TelegramForbiddenError, TelegramBadRequest):
+            await bot.edit_message_text(reviewed_text, chat_id=notification["staff_id"],
+                                        message_id=notification["message_id"], reply_markup=None)
+            updated_messages += 1
+    if not updated_messages:
+        with suppress(TelegramBadRequest):
+            await call.message.edit_text(reviewed_text, reply_markup=None)
     with suppress(TelegramForbiddenError):
         await bot.send_message(uid, f"Arizangiz holati: {label}" +
                               ("\nEndi vazifalaringizni menyudan kuzatishingiz mumkin." if status == "accepted" else
@@ -1036,9 +1055,7 @@ async def review(call: CallbackQuery, bot: Bot):
         if status == "accepted":
             await bot.send_message(uid, "Kerakli bo‘limni tanlang:",
                                    reply_markup=main_inline_kb(show_application=False, accepted_user=True))
-    await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.answer(f"{label}: {html.escape(current['full_name'])}\nKo‘rib chiqdi: {html.escape(call.from_user.full_name)}")
-    await call.answer()
+    await call.answer(label, show_alert=True)
 
 
 async def users_keyboard(page=0, viewer_id=None):
