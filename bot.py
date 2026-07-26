@@ -5,7 +5,7 @@ import logging
 import os
 import re
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 from aiohttp import web
@@ -108,6 +108,7 @@ BUTTON_CATALOG = [
     ("refresh", "🔄 Yangilash"), ("continue", "Davom etish ➡️"),
     ("cancel", "❌ Bekor qilish"), ("send_task", "🚀 Yuborish"),
     ("done", "☑️ Bajardim"), ("remind", "🔔 Eslatma yuborish"),
+    ("my_tasks", "📥 Vazifalar"), ("my_completed_tasks", "✅ Tugallangan vazifalarim"),
     ("back", "⬅️ Orqaga"), ("previous", "⬅️"), ("next", "➡️"),
 ]
 BUTTON_LABELS = dict(BUTTON_CATALOG)
@@ -187,6 +188,11 @@ def user_mention(user, limit=60):
     return f"<a href='tg://user?id={int(data['tg_id'])}'>{h(label, limit)}</a>"
 
 
+def utc_datetime(value):
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+
 async def db_execute(sql: str, params=()):
     if pg_pool:
         async with pg_pool.connection() as conn:
@@ -248,6 +254,7 @@ async def init_db():
           role TEXT NOT NULL DEFAULT 'user', status TEXT NOT NULL DEFAULT 'draft',
           active_mode TEXT NOT NULL DEFAULT 'user',
           specialty TEXT,
+          rejected_at TEXT,
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS groups(
@@ -279,6 +286,8 @@ async def init_db():
             await db.execute("ALTER TABLE users ADD COLUMN portfolio_file_mime TEXT")
         if "age" not in user_columns:
             await db.execute("ALTER TABLE users ADD COLUMN age INTEGER")
+        if "rejected_at" not in user_columns:
+            await db.execute("ALTER TABLE users ADD COLUMN rejected_at TEXT")
         columns = {row[1] for row in await (await db.execute("PRAGMA table_info(task_users)")).fetchall()}
         if "status" not in columns:
             await db.execute("ALTER TABLE task_users ADD COLUMN status TEXT NOT NULL DEFAULT 'assigned'")
@@ -365,8 +374,12 @@ def kb_button(text, **kwargs):
     return KeyboardButton(text=text, **kwargs)
 
 
-def main_kb(staff=False, superadmin=False):
-    rows = [] if staff else [[kb_button("📝 Ariza to‘ldirish")]]
+def main_kb(staff=False, superadmin=False, show_application=True, accepted_user=False):
+    rows = []
+    if not staff and show_application:
+        rows.append([kb_button("📝 Ariza to‘ldirish")])
+    if not staff and accepted_user:
+        rows += [[kb_button("📥 Vazifalar"), kb_button("✅ Tugallangan vazifalarim")]]
     if staff:
         rows += [[kb_button("📊 Admin panel"), kb_button("👥 Userlar")],
                  [kb_button("➕ Topshiriq"), kb_button("📋 Topshiriqlar")],
@@ -374,11 +387,16 @@ def main_kb(staff=False, superadmin=False):
     if superadmin:
         rows += [[kb_button("🛡 Adminlar"), kb_button("🎨 Tugma dizayni")],
                  [kb_button("🔄 Rolni almashtirish")]]
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True) if rows else ReplyKeyboardRemove()
 
 
-def main_inline_kb(staff=False, superadmin=False):
-    rows = [] if staff else [[InlineKeyboardButton(text="📝 Ariza to‘ldirish", callback_data="menu:application")]]
+def main_inline_kb(staff=False, superadmin=False, show_application=True, accepted_user=False):
+    rows = []
+    if not staff and show_application:
+        rows.append([InlineKeyboardButton(text="📝 Ariza to‘ldirish", callback_data="menu:application")])
+    if not staff and accepted_user:
+        rows += [[InlineKeyboardButton(text="📥 Vazifalar", callback_data="menu:my_tasks"),
+                  InlineKeyboardButton(text="✅ Tugallangan vazifalarim", callback_data="menu:my_completed")]]
     if staff:
         rows += [[InlineKeyboardButton(text="📊 Admin panel", callback_data="menu:panel"),
                   InlineKeyboardButton(text="👥 Userlar", callback_data="menu:users")],
@@ -393,10 +411,17 @@ def main_inline_kb(staff=False, superadmin=False):
 
 
 async def send_main_menu(message, staff=False, superadmin=False):
+    profile = await db_one("SELECT status,rejected_at FROM users WHERE tg_id=?", (message.from_user.id,))
+    status = profile["status"] if profile else "draft"
+    show_application = status == "draft"
+    if status == "rejected" and profile["rejected_at"]:
+        rejected_at = utc_datetime(profile["rejected_at"])
+        show_application = datetime.now(timezone.utc) >= rejected_at + timedelta(hours=24)
+    accepted_user = not staff and status == "accepted"
     private = message.chat.type == ChatType.PRIVATE
     if private:
-        await message.answer("⌨️ Pastki menyu ham faol.", reply_markup=main_kb(staff, superadmin))
-    await message.answer("Kerakli bo‘limni tanlang:", reply_markup=main_inline_kb(staff, superadmin))
+        await message.answer("⌨️ Pastki menyu ham faol.", reply_markup=main_kb(staff, superadmin, show_application, accepted_user))
+    await message.answer("Kerakli bo‘limni tanlang:", reply_markup=main_inline_kb(staff, superadmin, show_application, accepted_user))
 
 
 def menu_texts(label):
@@ -733,9 +758,23 @@ async def cancel(message: Message, state: FSMContext):
 async def application_start(message: Message, state: FSMContext):
     if message.chat.type != ChatType.PRIVATE:
         return await message.answer("Ariza shaxsiy ma’lumotlarni saqlaydi. Uni botning shaxsiy chatida to‘ldiring.")
-    current = await db_one("SELECT status FROM users WHERE tg_id=?", (message.from_user.id,))
+    current = await db_one("SELECT status,rejected_at FROM users WHERE tg_id=?", (message.from_user.id,))
     if current and current["status"] == "blocked":
         return await message.answer("⛔ Profilingiz admin tomonidan vaqtincha bloklangan.")
+    if current and current["status"] == "pending":
+        return await message.answer("⏳ Arizangiz ko‘rib chiqilmoqda. Natija chiqquncha qayta ariza yuborib bo‘lmaydi.")
+    if current and current["status"] == "accepted":
+        return await message.answer("✅ Arizangiz qabul qilingan. Sizga qayta ariza topshirish kerak emas.",
+                                    reply_markup=main_inline_kb(accepted_user=True, show_application=False))
+    if current and current["status"] == "rejected" and current["rejected_at"]:
+        rejected_at = utc_datetime(current["rejected_at"])
+        available_at = rejected_at + timedelta(hours=24)
+        now = datetime.now(timezone.utc)
+        if now < available_at:
+            remaining = available_at - now
+            hours, remainder = divmod(max(1, int(remaining.total_seconds())), 3600)
+            minutes = remainder // 60
+            return await message.answer(f"❌ Arizangiz rad etilgan. Qayta topshirish uchun yana {hours} soat {minutes} daqiqa kuting.")
     await state.clear()
     await state.update_data(username=message.from_user.username)
     await state.set_state(Application.full_name)
@@ -862,8 +901,12 @@ async def app_edit(call: CallbackQuery, state: FSMContext):
 @router.callback_query(Application.confirm, F.data == "app:send")
 async def app_send(call: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
+    current = await db_one("SELECT status FROM users WHERE tg_id=?", (call.from_user.id,))
+    if current and current["status"] in {"pending", "accepted"}:
+        await state.clear()
+        return await call.answer("Ariza qayta yuborilishi mumkin emas", show_alert=True)
     await db_execute("""UPDATE users SET username=?,full_name=?,age=?,phone=?,portfolio=?,portfolio_file_id=?,
-      portfolio_file_name=?,portfolio_file_mime=?,about=?,status='pending' WHERE tg_id=?""",
+      portfolio_file_name=?,portfolio_file_mime=?,about=?,status='pending',rejected_at=NULL WHERE tg_id=?""",
       (call.from_user.username, data["full_name"], data["age"], data["phone"], data.get("portfolio"),
        data.get("portfolio_file_id"), data.get("portfolio_file_name"), data.get("portfolio_file_mime"),
        data["about"], call.from_user.id))
@@ -879,7 +922,8 @@ async def app_send(call: CallbackQuery, state: FSMContext, bot: Bot):
                                         caption=f"📎 {h(data.get('portfolio_file_name'), 200)}")
             delivered += 1
     await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.answer("✅ Arizangiz yuborildi." if delivered else "⚠️ Ariza saqlandi, ammo mas’ullarga xabar yetkazilmadi.", reply_markup=main_kb(False))
+    await call.message.answer("✅ Arizangiz yuborildi." if delivered else "⚠️ Ariza saqlandi, ammo mas’ullarga xabar yetkazilmadi.",
+                              reply_markup=main_kb(False, show_application=False))
     await state.clear(); await call.answer()
 
 
@@ -891,9 +935,17 @@ async def review(call: CallbackQuery, bot: Bot):
     if not current: return await call.answer("User topilmadi", show_alert=True)
     if current["status"] != "pending": return await call.answer(f"Bu ariza allaqachon: {STATUS_LABELS.get(current['status'], current['status'])}", show_alert=True)
     status = "accepted" if action == "accept" else "rejected"
-    await db_execute("UPDATE users SET status=? WHERE tg_id=?", (status, uid))
+    rejected_at = datetime.now(timezone.utc).isoformat(timespec="seconds") if status == "rejected" else None
+    await db_execute("UPDATE users SET status=?,rejected_at=? WHERE tg_id=?", (status, rejected_at, uid))
     label = "✅ Qabul qilindi" if status == "accepted" else "❌ Rad etildi"
-    with suppress(TelegramForbiddenError): await bot.send_message(uid, f"Arizangiz holati: {label}")
+    with suppress(TelegramForbiddenError):
+        await bot.send_message(uid, f"Arizangiz holati: {label}" +
+                              ("\nEndi vazifalaringizni menyudan kuzatishingiz mumkin." if status == "accepted" else
+                               "\nQayta arizani 24 soatdan keyin topshirishingiz mumkin."),
+                               reply_markup=main_kb(show_application=False, accepted_user=status == "accepted"))
+        if status == "accepted":
+            await bot.send_message(uid, "Kerakli bo‘limni tanlang:",
+                                   reply_markup=main_inline_kb(show_application=False, accepted_user=True))
     await call.message.edit_reply_markup(reply_markup=None)
     await call.message.answer(f"{label}: {html.escape(current['full_name'])}\nKo‘rib chiqdi: {html.escape(call.from_user.full_name)}")
     await call.answer()
@@ -1065,6 +1117,8 @@ async def inline_main_menu(call: CallbackQuery, state: FSMContext):
     if action == "groups": return await groups_list(actor_message)
     if action == "new_task": return await task_start(actor_message, state)
     if action == "tasks": return await tasks_list(actor_message)
+    if action == "my_tasks": return await my_tasks_list(actor_message, False)
+    if action == "my_completed": return await my_tasks_list(actor_message, True)
     if action == "admins": return await admins_list(actor_message)
     if action == "design": return await design_panel(actor_message)
     if action == "switch_role": return await change_mode(actor_message)
@@ -1274,6 +1328,61 @@ async def complete_task(call: CallbackQuery, bot: Bot):
     for chat_id in {assignment["group_id"], assignment["created_by"]}:
         with suppress(TelegramForbiddenError, TelegramBadRequest): await bot.send_message(chat_id, notice)
     await call.answer("Qabul qilindi")
+
+
+async def my_tasks_markup(user_id: int, completed: bool):
+    wanted = "completed" if completed else "assigned"
+    rows = await db_all("""SELECT t.id,t.name,t.deadline FROM task_users tu
+      JOIN tasks t ON t.id=tu.task_id WHERE tu.user_id=? AND tu.status=?
+      ORDER BY t.id DESC LIMIT 50""", (user_id, wanted))
+    b = InlineKeyboardBuilder()
+    kind = "completed" if completed else "active"
+    for task in rows:
+        b.button(text=f"#{task['id']} · {task['name'][:38]}", callback_data=f"mytask:{task['id']}:{kind}")
+    b.button(text="⬅️ Bosh menyu", callback_data="nav:home")
+    b.adjust(1)
+    return b.as_markup(), len(rows)
+
+
+async def my_tasks_list(message: Message, completed=False):
+    profile = await db_one("SELECT status FROM users WHERE tg_id=?", (message.from_user.id,))
+    if not profile or profile["status"] != "accepted":
+        return await message.answer("Bu bo‘lim faqat arizasi qabul qilingan userlar uchun.")
+    kb, total = await my_tasks_markup(message.from_user.id, completed)
+    title = "✅ Tugallangan vazifalarim" if completed else "📥 Vazifalar"
+    empty = "\nHozircha bu bo‘limda vazifa yo‘q." if not total else "\nKo‘rish uchun vazifani tanlang:"
+    await message.answer(f"<b>{title}</b> — {total} ta{empty}", reply_markup=kb)
+
+
+@router.message(F.text.in_(menu_texts("📥 Vazifalar")))
+async def active_user_tasks(message: Message):
+    await my_tasks_list(message, False)
+
+
+@router.message(F.text.in_(menu_texts("✅ Tugallangan vazifalarim")))
+async def completed_user_tasks(message: Message):
+    await my_tasks_list(message, True)
+
+
+@router.callback_query(F.data.startswith("mytask:"))
+async def my_task_detail(call: CallbackQuery):
+    _, raw_id, kind = call.data.split(":")
+    task_id = int(raw_id)
+    task = await db_one("""SELECT t.id,t.name,t.description,t.deadline,tu.status,tu.completed_at
+      FROM task_users tu JOIN tasks t ON t.id=tu.task_id
+      WHERE tu.task_id=? AND tu.user_id=?""", (task_id, call.from_user.id))
+    if not task: return await call.answer("Vazifa topilmadi", show_alert=True)
+    completed = task["status"] == "completed"
+    text = (f"<b>📌 #{task['id']} · {h(task['name'], 200)}</b>\n\n{h(task['description'], 2600)}\n\n"
+            f"⏰ <b>Muddat:</b> {h(task['deadline'], 200)}\n"
+            f"📊 <b>Holat:</b> {'✅ Tugallangan' if completed else '⏳ Bajarilmoqda'}")
+    if completed and task["completed_at"]: text += f"\n✅ <b>Tugallangan vaqt:</b> {h(task['completed_at'], 100)}"
+    back_action = "my_completed" if completed else "my_tasks"
+    buttons = []
+    if not completed:
+        buttons.append([InlineKeyboardButton(text="☑️ Bajardim", callback_data=f"done:{task_id}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Ro‘yxat", callback_data=f"menu:{back_action}")])
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)); await call.answer()
 
 
 async def tasks_keyboard(page=0):
