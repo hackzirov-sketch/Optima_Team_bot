@@ -1,5 +1,7 @@
 # Xodimlar va topshiriqlar Telegram boti
 
+> V1 relizi yakunlangan va feature freeze holatida. To‘liq reliz qaydlari: [V1_RELEASE.md](V1_RELEASE.md)
+
 Aiogram 3 asosidagi bot: user arizasi, admin/manager tasdig‘i, guruhlarni ro‘yxatdan o‘tkazish va tanlangan xodimlarga topshiriq yuborish.
 
 ## Ishga tushirish
