@@ -77,6 +77,11 @@ class TaskForm(StatesGroup):
     confirm = State()
 
 
+class TaskEditForm(StatesGroup):
+    value = State()
+    users = State()
+
+
 class AdminManage(StatesGroup):
     add_id = State()
     remove_id = State()
@@ -407,7 +412,7 @@ async def init_db():
             await db.execute("ALTER TABLE task_users ADD COLUMN status TEXT NOT NULL DEFAULT 'assigned'")
         if "completed_at" not in columns:
             await db.execute("ALTER TABLE task_users ADD COLUMN completed_at TEXT")
-        for name, definition in {"result_text":"TEXT", "result_file_id":"TEXT", "result_file_name":"TEXT", "submitted_at":"TEXT", "review_note":"TEXT", "opened_at":"TEXT", "reminded_24":"INTEGER NOT NULL DEFAULT 0", "reminded_3":"INTEGER NOT NULL DEFAULT 0", "reminded_1":"INTEGER NOT NULL DEFAULT 0"}.items():
+        for name, definition in {"result_text":"TEXT", "result_file_id":"TEXT", "result_file_name":"TEXT", "submitted_at":"TEXT", "review_note":"TEXT", "opened_at":"TEXT", "reminded_24":"INTEGER NOT NULL DEFAULT 0", "reminded_3":"INTEGER NOT NULL DEFAULT 0", "reminded_1":"INTEGER NOT NULL DEFAULT 0", "reminded_overdue":"INTEGER NOT NULL DEFAULT 0"}.items():
             if name not in columns: await db.execute(f"ALTER TABLE task_users ADD COLUMN {name} {definition}")
         if "rating" not in columns: await db.execute("ALTER TABLE task_users ADD COLUMN rating INTEGER")
         for admin_id in SUPERADMINS:
@@ -1951,16 +1956,17 @@ async def deadline_shortcut(call:CallbackQuery,state:FSMContext):
     await call.message.edit_reply_markup(reply_markup=None);await finish_deadline(call.message,state,format_deadline(target),target.astimezone(timezone.utc));await call.answer()
 
 
-async def user_picker(selected: set[int], selection_mode="multiple"):
+async def user_picker(selected: set[int], selection_mode="multiple", callback_prefix="pick"):
     users = await db_all("""SELECT tg_id,full_name,username,specialty FROM users WHERE status='accepted'
       AND (role='user' OR specialty IS NOT NULL) ORDER BY full_name""")
     b = InlineKeyboardBuilder()
     for u in users:
         mark = "🔘" if selection_mode == "single" and u["tg_id"] in selected else ("✅" if u["tg_id"] in selected else "▫️")
         username = f"@{u['username']}" if u['username'] else "username yo‘q"
-        b.button(text=f"{mark} {u['full_name']} · {username} · {SPECIALTIES.get(u['specialty'], '—')}", callback_data=f"pick:{u['tg_id']}")
-    b.button(text=f"Davom etish ({len(selected)}) ➡️", callback_data="pick:done")
-    b.button(text="⬅️ Tanlash turiga qaytish", callback_data="pick:mode"); b.adjust(1)
+        b.button(text=f"{mark} {u['full_name']} · {username} · {SPECIALTIES.get(u['specialty'], '—')}", callback_data=f"{callback_prefix}:{u['tg_id']}")
+    b.button(text=f"Davom etish ({len(selected)}) ➡️", callback_data=f"{callback_prefix}:done")
+    if callback_prefix == "pick": b.button(text="⬅️ Tanlash turiga qaytish", callback_data="pick:mode")
+    b.adjust(1)
     return b.as_markup()
 
 
@@ -2288,11 +2294,97 @@ async def task_detail(call: CallbackQuery):
             f"⏰ {h(task['deadline'],200)}\n📂 {h(task['group_title'] or str(task['group_id']),200)}\n"
             f"👤 Yaratdi: {h(task['creator'] or str(task['created_by']),200)}\n\n<b>Ijrochilar:</b>\n{people}")
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Vazifani tahrirlash", callback_data=f"taskedit:{task_id}:{page}")],
         [InlineKeyboardButton(text="🔔 Eslatma yuborish", callback_data=f"remind:{task_id}:{page}")],
         [InlineKeyboardButton(text="🧾 Shablon sifatida saqlash", callback_data=f"tasksave:{task_id}")],
         [InlineKeyboardButton(text="⬅️ Ro‘yxat", callback_data=f"tasks:{page}")],
     ])
     await call.message.edit_text(text, reply_markup=kb); await call.answer()
+
+
+@router.callback_query(F.data.startswith("taskedit:"))
+async def task_edit_menu(call: CallbackQuery):
+    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    _, raw_id, page = call.data.split(":"); task_id = int(raw_id)
+    if not await db_one("SELECT 1 ok FROM tasks WHERE id=?", (task_id,)):
+        return await call.answer("Topshiriq topilmadi", show_alert=True)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Nomi", callback_data=f"taskeditfield:name:{task_id}:{page}"),
+         InlineKeyboardButton(text="📄 Tavsifi", callback_data=f"taskeditfield:description:{task_id}:{page}")],
+        [InlineKeyboardButton(text="🕒 Sana va vaqt", callback_data=f"taskeditfield:deadline:{task_id}:{page}")],
+        [InlineKeyboardButton(text="👥 Ijrochilar", callback_data=f"taskeditusers:{task_id}:{page}")],
+        [InlineKeyboardButton(text="⬅️ Vazifaga qaytish", callback_data=f"taskview:{task_id}:{page}")],
+    ])
+    await call.message.edit_text(f"<b>✏️ #{task_id} vazifani tahrirlash</b>\n\nO‘zgartiriladigan bo‘limni tanlang:", reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("taskeditfield:"))
+async def task_edit_field(call: CallbackQuery, state: FSMContext):
+    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    _, field, raw_id, page = call.data.split(":")
+    await state.set_state(TaskEditForm.value)
+    await state.update_data(edit_task_id=int(raw_id), edit_task_page=int(page), edit_task_field=field)
+    prompt = {"name": "Yangi vazifa nomini yozing:", "description": "Yangi vazifa tavsifini yozing:",
+              "deadline": "Yangi sana va vaqtni 24 soatlik formatda yozing:\n<code>30.07.2026 18:00</code>"}[field]
+    await call.message.edit_text(prompt); await call.answer()
+
+
+@router.message(TaskEditForm.value, F.text)
+async def task_edit_value(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data(); task_id = data["edit_task_id"]; field = data["edit_task_field"]; value = message.text.strip()
+    if field == "deadline":
+        parsed = parse_deadline(value)
+        if not parsed or parsed <= datetime.now(timezone.utc):
+            return await message.answer("Kelajakdagi vaqtni <code>30.07.2026 18:00</code> formatida yozing.")
+        await db_execute("UPDATE tasks SET deadline=?,deadline_at=? WHERE id=?", (format_deadline(parsed), parsed.isoformat(timespec="seconds"), task_id))
+    else:
+        if not value: return await message.answer("Qiymat bo‘sh bo‘lmasligi kerak.")
+        await db_execute(f"UPDATE tasks SET {field}=? WHERE id=?", (value, task_id))
+    await refresh_group_task_message(bot, task_id)
+    await audit(message.from_user.id, "task_edited", "task", task_id, field)
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📌 Vazifani ko‘rish", callback_data=f"taskview:{task_id}:{data['edit_task_page']}")]])
+    await message.answer("✅ Vazifa yangilandi. Guruhdagi xabar ham yangilandi.", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("taskeditusers:"))
+async def task_edit_users_start(call: CallbackQuery, state: FSMContext):
+    if not await is_staff(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    _, raw_id, page = call.data.split(":"); task_id = int(raw_id)
+    rows = await db_all("SELECT user_id FROM task_users WHERE task_id=?", (task_id,))
+    selected = {x["user_id"] for x in rows}
+    await state.set_state(TaskEditForm.users)
+    await state.update_data(edit_task_id=task_id, edit_task_page=int(page), selected=list(selected))
+    await call.message.edit_text("Ijrochilarni belgilang:", reply_markup=await user_picker(selected, "multiple", "editpick")); await call.answer()
+
+
+@router.callback_query(TaskEditForm.users, F.data.startswith("editpick:"))
+async def task_edit_users_save(call: CallbackQuery, state: FSMContext, bot: Bot):
+    value = call.data.split(":", 1)[1]; data = await state.get_data(); selected = set(data.get("selected", [])); task_id = data["edit_task_id"]
+    if value != "done":
+        selected.symmetric_difference_update({int(value)})
+        await state.update_data(selected=list(selected))
+        await call.message.edit_reply_markup(reply_markup=await user_picker(selected, "multiple", "editpick")); return await call.answer()
+    if not selected: return await call.answer("Kamida bitta ijrochi tanlang", show_alert=True)
+    previous_rows = await db_all("SELECT user_id FROM task_users WHERE task_id=?", (task_id,))
+    previous = {row["user_id"] for row in previous_rows}
+    placeholders = ",".join("?" for _ in selected)
+    await db_execute(f"DELETE FROM task_users WHERE task_id=? AND user_id NOT IN ({placeholders})", (task_id, *selected))
+    for user_id in selected:
+        await db_execute("INSERT INTO task_users(task_id,user_id) VALUES(?,?) ON CONFLICT(task_id,user_id) DO NOTHING", (task_id, user_id))
+    await refresh_group_task_message(bot, task_id)
+    task = await db_one("SELECT name,description,deadline FROM tasks WHERE id=?", (task_id,))
+    for user_id in selected - previous:
+        with suppress(TelegramForbiddenError, TelegramBadRequest):
+            await bot.send_message(user_id, f"📌 <b>Vazifaga biriktirildingiz</b>\n\n<b>{h(task['name'],200)}</b>\n{h(task['description'],1800)}\n\n⏰ {h(task['deadline'],150)}")
+    for user_id in previous - selected:
+        with suppress(TelegramForbiddenError, TelegramBadRequest):
+            await bot.send_message(user_id, f"ℹ️ Siz <b>{h(task['name'],200)}</b> vazifasi ijrochilaridan olib tashlandingiz.")
+    await audit(call.from_user.id, "task_assignees_edited", "task", task_id, f"count:{len(selected)}")
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📌 Vazifani ko‘rish", callback_data=f"taskview:{task_id}:{data['edit_task_page']}")]])
+    await call.message.edit_text("✅ Ijrochilar yangilandi.", reply_markup=kb); await call.answer()
 
 
 @router.callback_query(F.data.startswith("tasksave:"))
@@ -2393,6 +2485,40 @@ async def set_manager(message: Message):
     await message.answer("✅ Manager tayinlandi.")
 
 
+@router.message(Command("admin"))
+async def urgent_admin_message(message: Message, bot: Bot):
+    if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        return await message.answer("Bu komanda faqat guruhda ishlaydi:\n<code>/admin muhim xabaringiz</code>")
+    profile = await db_one("SELECT full_name,status FROM users WHERE tg_id=?", (message.from_user.id,))
+    if not profile or profile["status"] != "accepted":
+        return await message.reply("Bu komanda faqat qabul qilingan jamoa a’zolari uchun.")
+    urgent_text = (message.text or "").partition(" ")[2].strip()
+    if not urgent_text:
+        return await message.reply("Muhim xabarni ham yozing:\n<code>/admin Serverda muammo bor</code>")
+    admins = await db_all("""SELECT tg_id,full_name,username FROM users
+      WHERE role IN ('admin','superadmin') AND status<>'blocked' ORDER BY role,full_name""")
+    if not admins: return await message.reply("Faol adminlar topilmadi.")
+    mentions = " ".join(user_mention(admin, 60) for admin in admins)
+    group_text = (f"🚨 <b>ADMINLARGA SHOSHILINCH MUROJAAT</b>\n{mentions}\n\n"
+                  f"👤 {user_mention({'tg_id': message.from_user.id, 'full_name': profile['full_name'], 'username': message.from_user.username}, 80)}\n"
+                  f"💬 {h(urgent_text, 2500)}")
+    await message.reply(group_text)
+    private_text = (f"🚨 <b>Guruhdan shoshilinch murojaat</b>\n"
+                    f"📂 {h(message.chat.title or str(message.chat.id), 150)}\n"
+                    f"👤 {h(profile['full_name'], 100)}"
+                    f"{f' (@{h(message.from_user.username, 60)})' if message.from_user.username else ''}\n\n"
+                    f"{h(urgent_text, 2500)}")
+    delivered = 0
+    for admin in admins:
+        try:
+            await bot.send_message(admin["tg_id"], private_text)
+            delivered += 1
+        except (TelegramForbiddenError, TelegramBadRequest):
+            pass
+    await audit(message.from_user.id, "urgent_admin_message", "group", message.chat.id, urgent_text[:300])
+    await message.answer(f"✅ Murojaat guruhda belgilandi va {delivered} ta adminga bot orqali yuborildi.")
+
+
 @router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def capture_group_user(message: Message):
     """Keep Telegram names current when a person is active in a registered group."""
@@ -2425,14 +2551,16 @@ async def automatic_reminders(bot:Bot):
     while True:
         try:
             rows=await db_all("""SELECT t.id,t.name,t.deadline,t.deadline_at,t.group_id,tu.user_id,tu.status,
-              tu.reminded_24,tu.reminded_3,tu.reminded_1,u.full_name,u.username,u.tg_id
+              tu.reminded_24,tu.reminded_3,tu.reminded_1,tu.reminded_overdue,u.full_name,u.username,u.tg_id
               FROM task_users tu JOIN tasks t ON t.id=tu.task_id JOIN users u ON u.tg_id=tu.user_id
               WHERE t.deadline_at IS NOT NULL AND tu.status NOT IN ('approved','completed','submitted')""")
             now=datetime.now(timezone.utc)
             for row in rows:
                 hours=(utc_datetime(row['deadline_at'])-now).total_seconds()/3600
                 flag=None;label=None
-                if hours<=1 and not row['reminded_1']:flag='reminded_1';label="1 soatdan kam"
+                if hours<=0:
+                    if not row['reminded_overdue']:flag='reminded_overdue';label="muddat o‘tdi"
+                elif hours<=1 and not row['reminded_1']:flag='reminded_1';label="1 soatdan kam"
                 elif hours<=3 and not row['reminded_3']:flag='reminded_3';label="3 soatdan kam"
                 elif hours<=24 and not row['reminded_24']:flag='reminded_24';label="24 soatdan kam"
                 if not flag:continue
@@ -2458,7 +2586,7 @@ async def main():
     await init_db()
     bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage()); dp.include_router(router)
-    await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash"), BotCommand(command="panel", description="Admin panel"), BotCommand(command="status", description="V1 ishlash holati"), BotCommand(command="cancel", description="Joriy amalni bekor qilish"), BotCommand(command="register_group", description="Joriy guruhni ro‘yxatdan o‘tkazish"), BotCommand(command="add_group", description="Guruh ID orqali qo‘shish"), BotCommand(command="add_admin", description="ID orqali admin tayinlash"), BotCommand(command="remove_admin", description="ID orqali adminni olib tashlash")])
+    await bot.set_my_commands([BotCommand(command="start", description="Botni boshlash"), BotCommand(command="admin", description="Guruhda adminlarga shoshilinch xabar"), BotCommand(command="panel", description="Admin panel"), BotCommand(command="status", description="V1 ishlash holati"), BotCommand(command="cancel", description="Joriy amalni bekor qilish"), BotCommand(command="register_group", description="Joriy guruhni ro‘yxatdan o‘tkazish"), BotCommand(command="add_group", description="Guruh ID orqali qo‘shish"), BotCommand(command="add_admin", description="ID orqali admin tayinlash"), BotCommand(command="remove_admin", description="ID orqali adminni olib tashlash")])
     runner = web.AppRunner(create_health_app())
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000"))).start()
