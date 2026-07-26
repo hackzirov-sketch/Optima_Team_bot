@@ -257,11 +257,11 @@ async def init_db():
         await db_one("SELECT 1 AS ok")
         for admin_id in SUPERADMINS:
             await db_execute("""INSERT INTO users(tg_id,full_name,role,status)
-              VALUES(?,?,'superadmin','accepted') ON CONFLICT(tg_id) DO UPDATE SET role='superadmin',status='accepted'""",
+              VALUES(?,?,'superadmin','accepted') ON CONFLICT(tg_id) DO UPDATE SET role='superadmin'""",
               (admin_id, "Superadmin"))
         for admin_id in BOOTSTRAP_ADMINS - SUPERADMINS:
             await db_execute("""INSERT INTO users(tg_id,full_name,role,status)
-              VALUES(?,?,'admin','accepted') ON CONFLICT(tg_id) DO UPDATE SET role='admin',status='accepted'""",
+              VALUES(?,?,'admin','accepted') ON CONFLICT(tg_id) DO UPDATE SET role='admin'""",
               (admin_id, f"Admin {admin_id}"))
         if DEFAULT_GROUP_ID:
             await db_execute("""INSERT INTO groups(chat_id,title,added_by) VALUES(?,? ,NULL)
@@ -330,11 +330,11 @@ async def init_db():
             if name not in columns: await db.execute(f"ALTER TABLE task_users ADD COLUMN {name} {definition}")
         for admin_id in SUPERADMINS:
             await db.execute("""INSERT INTO users(tg_id,full_name,role,status)
-              VALUES(?,?,'superadmin','accepted') ON CONFLICT(tg_id) DO UPDATE SET role='superadmin',status='accepted'""",
+              VALUES(?,?,'superadmin','accepted') ON CONFLICT(tg_id) DO UPDATE SET role='superadmin'""",
               (admin_id, "Superadmin"))
         for admin_id in BOOTSTRAP_ADMINS - SUPERADMINS:
             await db.execute("""INSERT INTO users(tg_id,full_name,role,status)
-              VALUES(?,?,'admin','accepted') ON CONFLICT(tg_id) DO UPDATE SET role='admin',status='accepted'""",
+              VALUES(?,?,'admin','accepted') ON CONFLICT(tg_id) DO UPDATE SET role='admin'""",
               (admin_id, f"Admin {admin_id}"))
         if DEFAULT_GROUP_ID:
             await db.execute("""INSERT INTO groups(chat_id,title,added_by) VALUES(?,? ,NULL)
