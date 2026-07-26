@@ -1,7 +1,9 @@
 import asyncio
 import html
+import json
 import logging
 import os
+import re
 from contextlib import suppress
 from datetime import datetime
 
@@ -10,7 +12,7 @@ from aiohttp import web
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.enums import ChatType, ParseMode
+from aiogram.enums import ChatType, MessageEntityType, ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
@@ -77,31 +79,88 @@ class AdminManage(StatesGroup):
 
 class DesignForm(StatesGroup):
     emoji_id = State()
+    preview = State()
 
 
 PAGE_SIZE = 8
 STATUS_LABELS = {"draft": "To‘ldirilmagan", "pending": "Kutilmoqda", "accepted": "Qabul qilingan", "rejected": "Rad etilgan", "blocked": "Bloklangan"}
 ROLE_LABELS = {"user": "User", "manager": "Manager", "admin": "Admin", "superadmin": "Superadmin"}
 SPECIALTIES = {"backend": "Backend", "frontend": "Frontend", "fullstack": "Full stack", "vibecoder": "Vibecoder"}
-DESIGN = {"button_style": "primary", "premium_emoji_id": ""}
+DESIGN = {"button_style": "primary", "premium_emoji_id": "", "button_designs": {}}
+
+BUTTON_CATALOG = [
+    ("application", "📝 Ariza to‘ldirish"), ("admin_panel", "📊 Admin panel"),
+    ("users", "👥 Userlar"), ("new_task", "➕ Topshiriq"),
+    ("tasks", "📋 Topshiriqlar"), ("groups", "📂 Guruhlar"),
+    ("admins", "🛡 Adminlar"), ("button_design", "🎨 Tugma dizayni"),
+    ("switch_role", "🔄 Rolni almashtirish"), ("superadmin", "👑 Superadmin"),
+    ("admin", "🛡 Admin"), ("user", "👤 User"),
+    ("backend", "⚙️ Backend"), ("frontend", "🎨 Frontend"),
+    ("fullstack", "🧩 Full stack"), ("vibecoder", "✨ Vibecoder"),
+    ("send_phone", "📱 Telefon raqamni yuborish"),
+    ("appoint_admin", "➕ Admin tayinlash"), ("remove_admin", "➖ Adminni olib tashlash"),
+    ("edit", "✏️ Tahrirlash"), ("send_application", "📨 Arizani jo‘natish"),
+    ("reject", "❌ Rad etish"), ("accept", "✅ Qabul qilish"),
+    ("activate", "✅ Faollashtirish"), ("block", "⛔ Bloklash"),
+    ("refresh", "🔄 Yangilash"), ("continue", "Davom etish ➡️"),
+    ("cancel", "❌ Bekor qilish"), ("send_task", "🚀 Yuborish"),
+    ("done", "☑️ Bajardim"), ("remind", "🔔 Eslatma yuborish"),
+    ("back", "⬅️ Orqaga"), ("previous", "⬅️"), ("next", "➡️"),
+]
+BUTTON_LABELS = dict(BUTTON_CATALOG)
+
+
+def infer_button_key(text: str):
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    for key, label in BUTTON_CATALOG:
+        if clean == label or clean.startswith(label + " "):
+            return key
+    if clean.startswith("⬅️"): return "back"
+    if clean.startswith("✅ Faollashtirish"): return "activate"
+    if clean.startswith("⛔ Bloklash"): return "block"
+    return None
+
+
+def button_appearance(text: str, design_key=None):
+    key = design_key or infer_button_key(text)
+    custom = DESIGN["button_designs"].get(key, {}) if key else {}
+    style = custom["style"] if "style" in custom else DESIGN["button_style"]
+    emoji = custom["emoji_id"] if "emoji_id" in custom else DESIGN["premium_emoji_id"]
+    return (None if style == "default" else style or None), emoji or None
+
+
+def button_label(text: str, emoji_id):
+    if not emoji_id:
+        return text
+    _icon, separator, label = str(text).partition(" ")
+    return label if separator and label else text
 
 
 def InlineKeyboardButton(**kwargs):
-    kwargs["style"] = DESIGN["button_style"]
-    kwargs.setdefault("icon_custom_emoji_id", DESIGN["premium_emoji_id"] or None)
+    design_key = kwargs.pop("design_key", None)
+    style, emoji = button_appearance(kwargs.get("text", ""), design_key)
+    kwargs["text"] = button_label(kwargs.get("text", ""), emoji)
+    kwargs["style"] = style
+    kwargs["icon_custom_emoji_id"] = emoji
     return AiogramInlineKeyboardButton(**kwargs)
 
 
 def KeyboardButton(**kwargs):
-    kwargs.setdefault("style", DESIGN["button_style"])
-    kwargs.setdefault("icon_custom_emoji_id", DESIGN["premium_emoji_id"] or None)
+    design_key = kwargs.pop("design_key", None)
+    style, emoji = button_appearance(kwargs.get("text", ""), design_key)
+    kwargs["text"] = button_label(kwargs.get("text", ""), emoji)
+    kwargs["style"] = style
+    kwargs["icon_custom_emoji_id"] = emoji
     return AiogramKeyboardButton(**kwargs)
 
 
 class InlineKeyboardBuilder(AiogramInlineKeyboardBuilder):
     def button(self, **kwargs):
-        kwargs["style"] = DESIGN["button_style"]
-        kwargs.setdefault("icon_custom_emoji_id", DESIGN["premium_emoji_id"] or None)
+        design_key = kwargs.pop("design_key", None)
+        style, emoji = button_appearance(kwargs.get("text", ""), design_key)
+        kwargs["text"] = button_label(kwargs.get("text", ""), emoji)
+        kwargs["style"] = style
+        kwargs["icon_custom_emoji_id"] = emoji
         return super().button(**kwargs)
 
 
@@ -265,18 +324,27 @@ async def is_staff(user_id: int) -> bool:
 async def load_design():
     with suppress(Exception):
         for row in await db_all("SELECT key,value FROM settings"):
-            if row["key"] in DESIGN: DESIGN[row["key"]] = row["value"]
+            if row["key"] == "button_designs":
+                DESIGN["button_designs"] = json.loads(row["value"] or "{}")
+            elif row["key"] in DESIGN:
+                DESIGN[row["key"]] = row["value"]
 
 
 async def save_setting(key, value):
+    stored_value = json.dumps(value, ensure_ascii=False) if key == "button_designs" else value
     await db_execute("""INSERT INTO settings(key,value) VALUES(?,?)
-      ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (key, value))
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (key, stored_value))
     DESIGN[key] = value
 
 
+async def save_button_design(key, style, emoji_id):
+    designs = dict(DESIGN["button_designs"])
+    designs[key] = {"style": style, "emoji_id": emoji_id}
+    await save_setting("button_designs", designs)
+
+
 def kb_button(text, **kwargs):
-    return KeyboardButton(text=text, style=DESIGN["button_style"],
-                          icon_custom_emoji_id=DESIGN["premium_emoji_id"] or None, **kwargs)
+    return KeyboardButton(text=text, **kwargs)
 
 
 def main_kb(staff=False, superadmin=False):
@@ -433,55 +501,161 @@ async def remove_admin_command(message: Message, state: FSMContext):
     await set_admin_role(message, state, False, parts[1])
 
 
+def design_catalog_keyboard(page=0):
+    page_size = 7
+    pages = max(1, (len(BUTTON_CATALOG) + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    rows = []
+    page_buttons = []
+    for key, label in BUTTON_CATALOG[page * page_size:(page + 1) * page_size]:
+        cfg = DESIGN["button_designs"].get(key, {})
+        style_icon = {"primary": "🔵", "success": "🟢", "danger": "🔴"}.get(cfg.get("style"), "⚪")
+        emoji_icon = "✨" if cfg.get("emoji_id") else ""
+        page_buttons.append(AiogramInlineKeyboardButton(text=f"{style_icon}{emoji_icon} {label}", callback_data=f"design:button:{key}"))
+    rows.extend(page_buttons[index:index + 2] for index in range(0, len(page_buttons), 2))
+    nav = []
+    if page: nav.append(AiogramInlineKeyboardButton(text="⬅️", callback_data=f"design:list:{page-1}"))
+    nav.append(AiogramInlineKeyboardButton(text=f"{page+1}/{pages}", callback_data="noop"))
+    if page + 1 < pages: nav.append(AiogramInlineKeyboardButton(text="➡️", callback_data=f"design:list:{page+1}"))
+    rows.append(nav)
+    return InlineKeyboardMarkup(inline_keyboard=rows), page
+
+
+async def show_design_catalog(target, page=0, edit=False):
+    kb, page = design_catalog_keyboard(page)
+    text = ("<b>🎨 Barcha tugmalar dizayni</b>\n\n"
+            "Sozlamoqchi bo‘lgan tugmani tanlang. ⚪ — global dizayn, rangli belgi — alohida dizayn, ✨ — premium emoji.")
+    if edit:
+        await target.edit_text(text, reply_markup=kb)
+    else:
+        await target.answer(text, reply_markup=kb)
+
+
 @router.message(F.text == "🎨 Tugma dizayni")
 async def design_panel(message: Message):
     if not await require_superadmin(message.from_user.id): return await message.answer("Superadmin rejimini tanlang.")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔵 Ko‘k", callback_data="design:style:primary", style="primary"),
-         InlineKeyboardButton(text="🟢 Yashil", callback_data="design:style:success", style="success"),
-         InlineKeyboardButton(text="🔴 Qizil", callback_data="design:style:danger", style="danger")],
-        [InlineKeyboardButton(text="✨ Premium emoji ID", callback_data="design:emoji")],
-        [InlineKeyboardButton(text="🧹 Emojini olib tashlash", callback_data="design:emoji:clear")],
-    ])
-    emoji = DESIGN["premium_emoji_id"] or "o‘rnatilmagan"
-    await message.answer(f"<b>🎨 Tugmalar dizayni</b>\n\nRang: {DESIGN['button_style']}\nPremium emoji ID: <code>{emoji}</code>", reply_markup=kb)
+    await show_design_catalog(message)
 
 
-@router.callback_query(F.data.startswith("design:style:"))
-async def set_button_style(call: CallbackQuery):
+@router.callback_query(F.data.startswith("design:list:"))
+async def design_list_page(call: CallbackQuery):
     if not await require_superadmin(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
-    style = call.data.split(":")[2]
-    if style not in {"primary","success","danger"}: return
-    await save_setting("button_style", style); await call.answer("Rang saqlandi", show_alert=True)
-
-
-@router.callback_query(F.data == "design:emoji")
-async def ask_emoji(call: CallbackQuery, state: FSMContext):
-    if not await require_superadmin(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
-    await state.set_state(DesignForm.emoji_id)
-    await call.message.answer("Premium custom emoji ID’ni yuboring. ID’ni custom emoji xabaridan maxsus info bot orqali olish mumkin.")
+    await show_design_catalog(call.message, int(call.data.rsplit(":", 1)[1]), edit=True)
     await call.answer()
 
 
-@router.callback_query(F.data == "design:emoji:clear")
-async def clear_emoji(call: CallbackQuery):
+@router.callback_query(F.data.startswith("design:button:"))
+async def design_choose_button(call: CallbackQuery, state: FSMContext):
     if not await require_superadmin(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
-    await save_setting("premium_emoji_id", ""); await call.answer("Premium emoji olib tashlandi", show_alert=True)
+    key = call.data.rsplit(":", 1)[1]
+    if key not in BUTTON_LABELS: return await call.answer("Tugma topilmadi", show_alert=True)
+    current = DESIGN["button_designs"].get(key, {})
+    await state.update_data(design_key=key, design_style=current.get("style", DESIGN["button_style"]),
+                            design_emoji=current.get("emoji_id", DESIGN["premium_emoji_id"]))
+    rows = [[
+        AiogramInlineKeyboardButton(text="⚪ Standart", callback_data="design:pickstyle:default"),
+        AiogramInlineKeyboardButton(text="🔵 Ko‘k", callback_data="design:pickstyle:primary", style="primary"),
+    ], [
+        AiogramInlineKeyboardButton(text="🟢 Yashil", callback_data="design:pickstyle:success", style="success"),
+        AiogramInlineKeyboardButton(text="🔴 Qizil", callback_data="design:pickstyle:danger", style="danger"),
+    ], [AiogramInlineKeyboardButton(text="♻️ Defaultga qaytarish", callback_data=f"design:reset:{key}", style="danger")],
+       [AiogramInlineKeyboardButton(text="⬅️ Ro‘yxat", callback_data="design:list:0")]]
+    await call.message.edit_text(f"<b>{h(BUTTON_LABELS[key])}</b>\n\n1/3 — Tugma rangini tanlang:",
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("design:pickstyle:"))
+async def design_choose_style(call: CallbackQuery, state: FSMContext):
+    if not await require_superadmin(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    choice = call.data.rsplit(":", 1)[1]
+    style = choice
+    if style not in {"default", "primary", "success", "danger"}: return await call.answer("Noto‘g‘ri rang", show_alert=True)
+    await state.update_data(design_style=style)
+    rows = [[AiogramInlineKeyboardButton(text="✨ Premium emojini yuborish", callback_data="design:pickemoji:custom")],
+            [AiogramInlineKeyboardButton(text="🙂 Unicode fallback", callback_data="design:pickemoji:none")]]
+    await call.message.edit_text("2/3 — Tugma uchun emoji variantini tanlang:",
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("design:pickemoji:"))
+async def design_choose_emoji(call: CallbackQuery, state: FSMContext):
+    if not await require_superadmin(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    choice = call.data.rsplit(":", 1)[1]
+    if choice == "custom":
+        await state.set_state(DesignForm.emoji_id)
+        await call.message.edit_text("Bitta animatsion Telegram Premium emojini yuboring. ID avtomatik aniqlanadi. /cancel bilan bekor qilishingiz mumkin.")
+        return await call.answer()
+    emoji = None
+    await state.update_data(design_emoji=emoji)
+    await show_design_preview(call.message, state)
+    await call.answer()
+
+
+async def show_design_preview(message, state):
+    data = await state.get_data()
+    key, style, emoji = data.get("design_key"), data.get("design_style"), data.get("design_emoji", "")
+    if key not in BUTTON_LABELS: return await message.answer("Dizayn sessiyasi tugagan. Qaytadan tanlang.")
+    await state.set_state(DesignForm.preview)
+    preview = AiogramInlineKeyboardButton(text=button_label(BUTTON_LABELS[key], emoji), callback_data="noop",
+                                          style=None if style == "default" else style,
+                                          icon_custom_emoji_id=emoji or None)
+    save = AiogramInlineKeyboardButton(text="💾 Saqlash", callback_data="design:save", style="success")
+    back = AiogramInlineKeyboardButton(text="⬅️ Qayta tanlash", callback_data=f"design:button:{key}")
+    await message.edit_text(f"<b>3/3 — Preview</b>\n\nRang: <code>{style}</code>\nEmoji: <code>{emoji or 'yo‘q'}</code>",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[preview], [save, back]]))
 
 
 @router.message(DesignForm.emoji_id)
 async def set_emoji(message: Message, state: FSMContext):
     if not await require_superadmin(message.from_user.id): await state.clear(); return
-    emoji_id = (message.text or "").strip()
-    if not emoji_id.isdigit(): return await message.answer("Custom emoji ID faqat raqamlardan iborat bo‘lishi kerak.")
+    entities = tuple(message.entities or ()) + tuple(message.caption_entities or ())
+    emoji_ids = [entity.custom_emoji_id for entity in entities
+                 if entity.type == MessageEntityType.CUSTOM_EMOJI and entity.custom_emoji_id]
+    emoji_id = emoji_ids[0] if len(emoji_ids) == 1 else None
+    if not emoji_id:
+        return await message.answer("Custom animatsion emoji aniqlanmadi. Faqat bitta Telegram Premium emojini yuboring.")
+    await state.update_data(design_emoji=emoji_id)
+    await state.set_state(DesignForm.preview)
+    data = await state.get_data()
+    key, style = data.get("design_key"), data.get("design_style")
     try:
-        await message.answer("Premium emoji tekshiruvi", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Test tugma", callback_data="noop", style=DESIGN["button_style"], icon_custom_emoji_id=emoji_id)
-        ]]))
+        preview = AiogramInlineKeyboardButton(text=button_label(BUTTON_LABELS[key], emoji_id), callback_data="noop",
+                                              style=None if style == "default" else style,
+                                              icon_custom_emoji_id=emoji_id)
+        save = AiogramInlineKeyboardButton(text="💾 Saqlash", callback_data="design:save", style="success")
+        back = AiogramInlineKeyboardButton(text="⬅️ Qayta tanlash", callback_data=f"design:button:{key}")
+        await message.answer(f"<b>3/3 — Preview</b>\n\nRang: <code>{style}</code>\nEmoji: <code>{emoji_id}</code>",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[preview], [save, back]]))
     except TelegramBadRequest:
-        return await message.answer("Telegram bu emoji ID’ni qabul qilmadi. Bot egasida Premium borligini va ID to‘g‘riligini tekshiring.")
-    await save_setting("premium_emoji_id", emoji_id); await state.clear()
-    await message.answer("✅ Premium emoji saqlandi. Yangi bosh sahifa tugmalarida ishlatiladi.")
+        await state.set_state(DesignForm.emoji_id)
+        return await message.answer("Telegram emoji ID’ni qabul qilmadi. Boshqa ID yuboring.")
+
+
+@router.callback_query(DesignForm.preview, F.data == "design:save")
+async def save_selected_design(call: CallbackQuery, state: FSMContext):
+    if not await require_superadmin(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    data = await state.get_data()
+    key = data.get("design_key")
+    if key not in BUTTON_LABELS: return await call.answer("Dizayn sessiyasi tugagan", show_alert=True)
+    await save_button_design(key, data.get("design_style", "default"), data.get("design_emoji"))
+    await state.clear()
+    await call.answer("Dizayn saqlandi ✅", show_alert=True)
+    await show_design_catalog(call.message, edit=True)
+
+
+@router.callback_query(F.data.startswith("design:reset:"))
+async def reset_selected_design(call: CallbackQuery, state: FSMContext):
+    if not await require_superadmin(call.from_user.id): return await call.answer("Ruxsat yo‘q", show_alert=True)
+    key = call.data.rsplit(":", 1)[1]
+    if key not in BUTTON_LABELS: return await call.answer("Tugma topilmadi", show_alert=True)
+    designs = dict(DESIGN["button_designs"])
+    designs.pop(key, None)
+    await save_setting("button_designs", designs)
+    await state.clear()
+    await call.answer("Default holat qaytarildi ✅", show_alert=True)
+    await show_design_catalog(call.message, edit=True)
 
 
 @router.message(Command("cancel"))
